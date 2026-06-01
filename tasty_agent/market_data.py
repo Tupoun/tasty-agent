@@ -18,8 +18,8 @@ def exchanges_for_symbols(streamer_symbols: list[str]) -> set[ExchangeType]:
     """Determine which exchanges to check based on streamer symbols."""
     exchanges: set[ExchangeType] = set()
     for sym in streamer_symbols:
-        if sym.startswith("/"):
-            if ":XCBF" in sym or sym.startswith("/VX"):
+        if sym.startswith("/") or sym.startswith("./"):
+            if ":XCBF" in sym or sym.startswith(("/VX", "./VX")):
                 exchanges.add(ExchangeType.CFE)
             else:
                 exchanges.add(ExchangeType.CME)

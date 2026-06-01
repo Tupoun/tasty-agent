@@ -12,7 +12,15 @@ from aiocache import Cache, cached
 from aiocache.serializers import PickleSerializer
 from pydantic import BaseModel, Field, model_validator
 from tastytrade import Session
-from tastytrade.instruments import Equity, Future, Option, TickSize, get_option_chain
+from tastytrade.instruments import (
+    Equity,
+    Future,
+    FutureOption,
+    Option,
+    TickSize,
+    get_future_option_chain,
+    get_option_chain,
+)
 from tastytrade.order import InstrumentType, NewOrder, OrderAction, OrderTimeInForce, OrderType
 
 logger = logging.getLogger(__name__)
@@ -38,7 +46,7 @@ class InstrumentDetail:
     """Details for a resolved instrument."""
 
     streamer_symbol: str
-    instrument: Equity | Option | Future
+    instrument: Equity | Option | Future | FutureOption
     is_index: bool = False
     tick_sizes: list[TickSize] | None = None
 
@@ -57,9 +65,9 @@ class InstrumentSpec(BaseModel):
 
 
 class OptionSpec(BaseModel):
-    """Specification for an equity option contract."""
+    """Specification for an option contract."""
 
-    symbol: str = Field(..., description="Underlying symbol, e.g. AAPL.")
+    symbol: str = Field(..., description="Underlying symbol, e.g. AAPL or /ES.")
     option_type: Literal["C", "P"] = Field(..., description="C=call, P=put.")
     strike_price: float = Field(..., description="Strike price")
     expiration_date: str = Field(..., description="YYYY-MM-DD")
@@ -280,7 +288,7 @@ def _asset_tick_size(tick_sizes: list[TickSize] | None, price: Decimal) -> Decim
     absolute_price = abs(price)
     threshold_matches = [tick for tick in tick_sizes if tick.threshold is not None and absolute_price >= tick.threshold]
     if threshold_matches:
-        tick = max(threshold_matches, key=lambda item: item.threshold)
+        tick = max(threshold_matches, key=lambda item: item.threshold or Decimal("0"))
         return tick.value
 
     thresholdless = [tick for tick in tick_sizes if tick.threshold is None]
@@ -543,10 +551,21 @@ def _option_chain_key_builder(fn, session: Session, symbol: str):
     return f"option_chain:{symbol}"
 
 
+def _future_option_chain_key_builder(fn, session: Session, symbol: str):
+    """Build cache key using only symbol (session changes but symbol is stable)."""
+    return f"future_option_chain:{symbol}"
+
+
 @cached(ttl=86400, cache=Cache.MEMORY, serializer=PickleSerializer(), key_builder=_option_chain_key_builder)
 async def get_cached_option_chain(session: Session, symbol: str):
     """Cache option chains for 24 hours as they rarely change during that timeframe."""
     return await get_option_chain(session, symbol)
+
+
+@cached(ttl=86400, cache=Cache.MEMORY, serializer=PickleSerializer(), key_builder=_future_option_chain_key_builder)
+async def get_cached_future_option_chain(session: Session, symbol: str):
+    """Cache futures option chains for 24 hours as they rarely change during that timeframe."""
+    return await get_future_option_chain(session, symbol)
 
 
 def resolve_instrument_type(spec: InstrumentSpec) -> InstrumentType:
@@ -588,6 +607,37 @@ async def _lookup_option_detail(session: Session, spec: InstrumentSpec, symbol: 
     available_strikes = [opt.strike_price for opt in chain[target_date] if opt.option_type.value == option_type]
     raise ValueError(
         f"Option not found: {symbol} {expiration_date} {option_type} {strike_price}. Available strikes: {sorted(set(available_strikes))}"
+    )
+
+
+async def _lookup_future_option_detail(session: Session, spec: InstrumentSpec, symbol: str) -> InstrumentDetail:
+    """Resolve a futures option contract from the cached futures option chain."""
+    if not spec.option_type:
+        raise ValueError(f"option_type ('C' or 'P') is required for option {symbol}")
+    option_type = spec.option_type
+    strike_price = Decimal(str(validate_strike_price(spec.strike_price)))
+    expiration_date = spec.expiration_date
+    if not expiration_date:
+        raise ValueError(f"expiration_date is required for option {symbol}")
+
+    target_date = validate_date_format(expiration_date)
+    chain = await get_cached_future_option_chain(session, symbol)
+    if target_date not in chain:
+        available_dates = sorted(chain.keys())
+        raise ValueError(f"No futures options found for {symbol} expiration {expiration_date}. Available: {available_dates}")
+
+    matching_options = [
+        option
+        for option in chain[target_date]
+        if Decimal(str(option.strike_price)) == strike_price and option.option_type.value == option_type
+    ]
+    if matching_options:
+        option = matching_options[0]
+        return InstrumentDetail(option.streamer_symbol, option)
+
+    available_strikes = [opt.strike_price for opt in chain[target_date] if opt.option_type.value == option_type]
+    raise ValueError(
+        f"Futures option not found: {symbol} {expiration_date} {option_type} {strike_price}. Available strikes: {sorted(set(available_strikes))}"
     )
 
 
@@ -656,6 +706,19 @@ async def get_instrument_details(session: Session, instrument_specs: list[Instru
     return await asyncio.gather(*[lookup_single_instrument(spec) for spec in instrument_specs])
 
 
+async def get_option_instrument_details(session: Session, option_specs: list[OptionSpec]) -> list[InstrumentDetail]:
+    """Get streamable option details for equity and futures option contracts."""
+
+    async def lookup_single_option(spec: OptionSpec) -> InstrumentDetail:
+        symbol = spec.symbol.upper()
+        instrument_spec = spec.to_instrument_spec()
+        if symbol.startswith("/"):
+            return await _lookup_future_option_detail(session, instrument_spec, symbol)
+        return await _lookup_option_detail(session, instrument_spec, symbol)
+
+    return await asyncio.gather(*[lookup_single_option(spec) for spec in option_specs])
+
+
 def build_order_legs(instrument_details: list[InstrumentDetail], legs: list[OrderLeg]) -> list:
     """Build order legs from instrument details and leg specifications."""
     if len(instrument_details) != len(legs):
@@ -674,6 +737,11 @@ def describe_instrument(detail: InstrumentDetail) -> str:
     """Build a concise instrument label for errors and logs."""
     instrument = detail.instrument
     if isinstance(instrument, Option):
+        return (
+            f"{instrument.underlying_symbol} "
+            f"{instrument.option_type.value}{instrument.strike_price} {instrument.expiration_date}"
+        )
+    if isinstance(instrument, FutureOption):
         return (
             f"{instrument.underlying_symbol} "
             f"{instrument.option_type.value}{instrument.strike_price} {instrument.expiration_date}"

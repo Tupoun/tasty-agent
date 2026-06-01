@@ -19,7 +19,7 @@ A Model Context Protocol server for TastyTrade brokerage accounts. Enables LLMs 
 
 ### Market Data & Research
 - **`get_quotes(instruments, timeout=10.0)`** - Real-time quotes for stocks, options, futures, and indices via DXLink streaming
-- **`get_greeks(options, timeout=10.0)`** - Greeks (delta, gamma, theta, vega, rho) for options via DXLink streaming
+- **`get_greeks(options, timeout=10.0)`** - Greeks (delta, gamma, theta, vega, rho) for equity and futures options via DXLink streaming
 - **`get_market_metrics(symbols)`** - IV rank, percentile, beta, liquidity for multiple symbols
 - **`market_status(exchanges=['Equity'])`** - Market hours, status, holidays, and current NYC time ('Equity', 'CME', 'CFE', 'Smalls')
 - **`search_symbols(symbol, limit=10)`** - Search for symbols by name/ticker
@@ -114,6 +114,7 @@ See [`examples/mcp_client.py`](examples/mcp_client.py) for the full client code.
 "Get real-time quotes for SPY and AAPL"
 "Get quotes for TQQQ C option with strike 100 expiring 2026-01-16"
 "Get Greeks for AAPL P option with strike 150 expiring 2024-12-20"
+"Get Greeks for /ES C option with strike 5800 expiring 2026-05-30"
 "Buy to open 100 AAPL shares at mid"
 "Buy to open 17 TQQQ calls, strike 100, exp 2026-01-16"
 "Buy $50K of TSLA calls, strike 300, exp 2026-01-16"

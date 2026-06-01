@@ -43,6 +43,7 @@ from tasty_agent.orders import (
     format_order_market,
     format_signed_money,
     get_instrument_details,
+    get_option_instrument_details,
     get_order_leg_instrument_details,
     resolve_order_price,
 )
@@ -494,7 +495,7 @@ async def get_greeks(ctx: Context, options: list[OptionSpec], timeout: float = 1
         raise ValueError("At least one option is required")
 
     session = get_session(ctx)
-    option_details = await get_instrument_details(session, [option.to_instrument_spec() for option in options])
+    option_details = await get_option_instrument_details(session, options)
 
     greeks = await _stream_events(session, Greeks, [d.streamer_symbol for d in option_details], timeout)
     return tool_xml("get_greeks", to_table([_compact_greeks_event(greek) for greek in greeks]))

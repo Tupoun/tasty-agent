@@ -10,7 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
-from tastytrade.instruments import Equity, Future, Option, OptionType, TickSize
+from tastytrade.instruments import Equity, Future, FutureOption, Option, OptionType, TickSize
 from tastytrade.market_sessions import ExchangeType, MarketStatus
 from tastytrade.order import InstrumentType, Leg, OrderAction, OrderTimeInForce
 
@@ -39,6 +39,7 @@ from tasty_agent.orders import (
     apply_order_sizing,
     build_order_legs,
     build_order_market,
+    get_option_instrument_details,
     resolve_order_price,
     validate_date_format,
     validate_strike_price,
@@ -47,6 +48,7 @@ from tasty_agent.server import (
     _compact_greeks_event,
     _compact_market_metric,
     _compact_quote_event,
+    get_greeks,
     market_status,
     place_order,
     replace_order,
@@ -344,6 +346,45 @@ class TestMarketStatusTool:
                 "close_at": "2026-04-23T20:00:00+00:00",
             }
         ]
+
+
+class TestGreeksTool:
+    """Tests for Greeks tool orchestration."""
+
+    @pytest.mark.asyncio
+    async def test_get_greeks_streams_resolved_future_option_symbol(self):
+        session = Mock()
+        mock_ctx = Mock()
+        mock_ctx.request_context = Mock()
+        mock_ctx.request_context.lifespan_context = SimpleNamespace(session=session)
+
+        option = OptionSpec(symbol="/ES", option_type="C", strike_price=5800, expiration_date="2026-05-30")
+        detail = InstrumentDetail("./ESM6 C5800", Mock())
+        greek = Mock()
+        greek.model_dump.return_value = {
+            "event_symbol": "./ESM6 C5800",
+            "price": Decimal("15.25"),
+            "volatility": Decimal("0.218"),
+            "delta": Decimal("0.45"),
+            "gamma": Decimal("0.01"),
+            "theta": Decimal("-0.75"),
+            "vega": Decimal("4.2"),
+            "rho": Decimal("0.03"),
+        }
+
+        with (
+            patch("tasty_agent.server.get_option_instrument_details", new=AsyncMock(return_value=[detail])) as resolver,
+            patch("tasty_agent.server._stream_events", new=AsyncMock(return_value=[greek])) as stream,
+        ):
+            result = await get_greeks(mock_ctx, [option], timeout=3.0)
+
+        resolver.assert_awaited_once_with(session, [option])
+        stream.assert_awaited_once()
+        assert stream.await_args.args[0] is session
+        assert stream.await_args.args[2] == ["./ESM6 C5800"]
+        assert stream.await_args.args[3] == 3.0
+        assert "./ESM6 C5800" in result
+        assert "<greeks>" in result
 
 
 class TestOrderTools:
@@ -894,6 +935,71 @@ class TestPydanticModels:
         assert ws.instrument_type == "Equity"
 
 
+class TestOptionInstrumentDetails:
+    """Tests for resolving option details used by market-data tools."""
+
+    @pytest.mark.asyncio
+    async def test_resolves_future_option_streamer_symbol(self):
+        session = Mock()
+        future_option = FutureOption.model_construct(
+            instrument_type=InstrumentType.FUTURE_OPTION,
+            symbol="./MESM6 P5800",
+            streamer_symbol="./MESM6 P5800",
+            underlying_symbol="/MES",
+            option_type=OptionType.PUT,
+            strike_price=Decimal("5800.0"),
+            expiration_date=date(2026, 5, 30),
+        )
+        chain = {date(2026, 5, 30): [future_option]}
+
+        with patch("tasty_agent.orders.get_cached_future_option_chain", new=AsyncMock(return_value=chain)) as mock_chain:
+            details = await get_option_instrument_details(
+                session,
+                [
+                    OptionSpec(
+                        symbol="/mes",
+                        option_type="P",
+                        strike_price=5800,
+                        expiration_date="2026-05-30",
+                    )
+                ],
+            )
+
+        assert details[0].streamer_symbol == "./MESM6 P5800"
+        assert details[0].instrument == future_option
+        mock_chain.assert_awaited_once_with(session, "/MES")
+
+    @pytest.mark.asyncio
+    async def test_future_option_missing_strike_lists_available_strikes(self):
+        session = Mock()
+        future_option = FutureOption.model_construct(
+            instrument_type=InstrumentType.FUTURE_OPTION,
+            symbol="./ESM6 C5800",
+            streamer_symbol="./ESM6 C5800",
+            underlying_symbol="/ES",
+            option_type=OptionType.CALL,
+            strike_price=Decimal("5800.0"),
+            expiration_date=date(2026, 5, 30),
+        )
+        chain = {date(2026, 5, 30): [future_option]}
+
+        with (
+            patch("tasty_agent.orders.get_cached_future_option_chain", new=AsyncMock(return_value=chain)),
+            pytest.raises(ValueError, match="Futures option not found: /ES 2026-05-30 C 5900"),
+        ):
+            await get_option_instrument_details(
+                session,
+                [
+                    OptionSpec(
+                        symbol="/ES",
+                        option_type="C",
+                        strike_price=5900,
+                        expiration_date="2026-05-30",
+                    )
+                ],
+            )
+
+
 class TestInstrumentDetail:
     """Tests for InstrumentDetail dataclass."""
 
@@ -913,8 +1019,14 @@ class TestExchangesForSymbols:
     def test_futures_cme(self):
         assert _exchanges_for_symbols(["/ESM26:XCME"]) == {ExchangeType.CME}
 
+    def test_futures_option_cme(self):
+        assert _exchanges_for_symbols(["./ESM6 C5800"]) == {ExchangeType.CME}
+
     def test_futures_cfe(self):
         assert _exchanges_for_symbols(["/VXJ26:XCBF"]) == {ExchangeType.CFE}
+
+    def test_futures_option_cfe(self):
+        assert _exchanges_for_symbols(["./VXJ6 C25"]) == {ExchangeType.CFE}
 
     def test_vx_prefix_without_xcbf(self):
         assert _exchanges_for_symbols(["/VXJ26"]) == {ExchangeType.CFE}
