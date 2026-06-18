@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 from datetime import UTC, datetime
 from decimal import Decimal
 from html import escape as escape_xml_text
@@ -53,7 +54,12 @@ logger = logging.getLogger(__name__)
 
 rate_limiter = AsyncLimiter(2, 1)  # 2 requests per second
 
-mcp_app = FastMCP("TastyTrade", lifespan=lifespan)
+mcp_app = FastMCP(
+    "TastyTrade",
+    lifespan=lifespan,
+    host=os.environ.get("FASTMCP_HOST", "127.0.0.1"),
+    port=int(os.environ.get("FASTMCP_PORT", "8000")),
+)
 
 TOOL_XML_TAGS = {
     "get_history": "history",
