@@ -43,11 +43,14 @@ from tasty_agent.orders import (
     find_live_order,
     format_order_market,
     format_signed_money,
+    get_cached_option_chain,
     get_instrument_details,
     get_option_instrument_details,
     get_order_leg_instrument_details,
     resolve_order_price,
+    validate_date_format,
 )
+from tasty_agent.strikes import compact_strike_match, find_nearest_strikes_by_delta, validate_target_deltas
 from tasty_agent.watchlists import WatchlistSymbol, manage_watchlist
 
 logger = logging.getLogger(__name__)
@@ -71,6 +74,7 @@ TOOL_XML_TAGS = {
     "get_greeks": "greeks",
     "get_market_metrics": "market_metrics",
     "search_symbols": "symbol_search",
+    "find_strikes_by_delta": "strikes_by_delta",
 }
 
 
@@ -505,6 +509,57 @@ async def get_greeks(ctx: Context, options: list[OptionSpec], timeout: float = 1
 
     greeks = await _stream_events(session, Greeks, [d.streamer_symbol for d in option_details], timeout)
     return tool_xml("get_greeks", to_table([_compact_greeks_event(greek) for greek in greeks]))
+
+
+@mcp_app.tool()
+async def find_strikes_by_delta(
+    ctx: Context,
+    symbol: str,
+    expiration_date: str,
+    target_deltas: list[float],
+    timeout: float = 10.0,
+) -> str:
+    """
+    Find the nearest option strikes for given target deltas.
+
+    Use this to quickly identify strikes at specific delta levels without
+    manually scanning the option chain. Common use case: finding wings for
+    iron condors, credit spreads, or other delta-targeted strategies.
+
+    Sign convention (strict):
+      Positive target -> searches CALLS (e.g. 0.16 finds ~16-delta call)
+      Negative target -> searches PUTS (e.g. -0.16 finds ~16-delta put)
+
+    For iron condor wings on both sides, use [0.16, -0.16].
+    For a single-side credit spread, use [0.30] (call) or [-0.30] (put).
+
+    Args:
+        symbol: Underlying symbol, e.g. SPY, AAPL, /ES.
+        expiration_date: YYYY-MM-DD. Use get_greeks with an invalid date
+            to discover available expirations.
+        target_deltas: List of target deltas. Sign determines side
+            (positive=call, negative=put). Example: [0.16, -0.16].
+        timeout: Seconds to wait for DXLink data.
+    """
+    validate_target_deltas(target_deltas)
+
+    session = get_session(ctx)
+    symbol = symbol.upper()
+    target_date = validate_date_format(expiration_date)
+
+    chain = await get_cached_option_chain(session, symbol)
+    if target_date not in chain:
+        available_dates = sorted(chain.keys())
+        raise ValueError(f"No options found for {symbol} expiration {expiration_date}. Available: {available_dates}")
+
+    options = chain[target_date]
+    streamer_symbols = [option.streamer_symbol for option in options]
+    greeks = await _stream_events(session, Greeks, streamer_symbols, timeout)
+    greeks_by_symbol = {greek.event_symbol: greek for greek in greeks}
+
+    matches = find_nearest_strikes_by_delta(options, greeks_by_symbol, target_deltas)
+    rows = [compact_strike_match(target, option, greek) for target, option, greek in matches]
+    return tool_xml("find_strikes_by_delta", to_table(rows))
 
 
 @mcp_app.tool()
