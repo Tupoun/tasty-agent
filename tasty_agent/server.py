@@ -12,6 +12,7 @@ from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.fastmcp.prompts.base import AssistantMessage, Message, UserMessage
 from tastytrade import metrics
 from tastytrade.dxfeed import Greeks, Quote
+from tastytrade.instruments import FutureOption, Option
 from tastytrade.market_sessions import ExchangeType, MarketStatus, get_market_holidays, get_market_sessions
 from tastytrade.order import OrderTimeInForce
 from tastytrade.search import symbol_search
@@ -52,7 +53,6 @@ from tasty_agent.orders import (
     validate_date_format,
 )
 from tasty_agent.strikes import (
-    compact_strike_match,
     find_nearest_strikes_by_delta,
     is_monthly_expiration,
     select_expiration_from_dte_range,
@@ -338,6 +338,23 @@ def _compact_greeks_event(event) -> dict[str, Any]:
     }
 
 
+def compact_strike_match(target: float, option: Option | FutureOption, greek: Greeks) -> dict[str, Any]:
+    """Format one delta-matched strike as a compact table row."""
+    greek_row = _compact_greeks_event(greek)
+    return {
+        "target": target,
+        "sym": greek_row.get("sym"),
+        "strike": compact_value(option.strike_price),
+        "type": option.option_type.value,
+        "delta": greek_row.get("delta"),
+        "price": greek_row.get("price"),
+        "iv": greek_row.get("iv"),
+        "gamma": greek_row.get("gamma"),
+        "theta": greek_row.get("theta"),
+        "vega": greek_row.get("vega"),
+    }
+
+
 def _compact_market_metric(metric) -> dict[str, Any]:
     data = metric.model_dump()
     earnings = getattr(metric, "earnings", None)
@@ -526,7 +543,7 @@ async def find_strikes_by_delta(
     expiration_date: str | None = None,
     min_dte: int | None = None,
     max_dte: int | None = None,
-    timeout: float = 10.0,
+    timeout: float = 60.0,
 ) -> str:
     """
     Find the nearest option strikes for given target deltas.
@@ -557,7 +574,9 @@ async def find_strikes_by_delta(
             to discover available expirations.
         min_dte: Minimum days to expiration (equity options only, requires max_dte).
         max_dte: Maximum days to expiration (equity options only, requires min_dte).
-        timeout: Seconds to wait for DXLink data.
+        timeout: Seconds to wait for DXLink data (default: 60). Full-chain
+            streaming may need more time than a single-strike lookup — this
+            matches the default used by get_gex, which streams the same way.
     """
     validate_target_deltas(target_deltas)
 

@@ -1,12 +1,9 @@
 from __future__ import annotations
 
 from datetime import date, timedelta
-from typing import Any
 
 from tastytrade.dxfeed import Greeks
 from tastytrade.instruments import FutureOption, Option
-
-from tasty_agent.core import compact_value
 
 
 def is_monthly_expiration(expiration: date) -> bool:
@@ -90,20 +87,3 @@ def find_nearest_strikes_by_delta(
         matches.append((target, option, greek))
 
     return matches
-
-
-def compact_strike_match(target: float, option: Option | FutureOption, greek: Greeks) -> dict[str, Any]:
-    """Format one delta-matched strike as a compact table row."""
-    data = greek.model_dump()
-    return {
-        "target": target,
-        "sym": compact_value(data.get("event_symbol")),
-        "strike": compact_value(option.strike_price),
-        "type": option.option_type.value,
-        "delta": compact_value(data.get("delta")),
-        "price": compact_value(data.get("price")),
-        "iv": compact_value(data.get("volatility")),
-        "gamma": compact_value(data.get("gamma")),
-        "theta": compact_value(data.get("theta")),
-        "vega": compact_value(data.get("vega")),
-    }
