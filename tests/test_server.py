@@ -55,7 +55,12 @@ from tasty_agent.server import (
     replace_order,
     tool_xml,
 )
-from tasty_agent.strikes import find_nearest_strikes_by_delta, validate_target_deltas
+from tasty_agent.strikes import (
+    find_nearest_strikes_by_delta,
+    is_monthly_expiration,
+    select_expiration_from_dte_range,
+    validate_target_deltas,
+)
 from tasty_agent.watchlists import WatchlistSymbol, _compact_watchlist
 
 
@@ -505,11 +510,49 @@ class TestFindNearestStrikesByDelta:
             find_nearest_strikes_by_delta([call_785], {}, [0.16])
 
 
+class TestIsMonthlyExpiration:
+    """Tests for standard-monthly (3rd Friday) expiration detection."""
+
+    def test_third_friday_is_monthly(self):
+        assert is_monthly_expiration(date(2026, 7, 17)) is True
+
+    def test_other_friday_is_not_monthly(self):
+        assert is_monthly_expiration(date(2026, 7, 10)) is False
+        assert is_monthly_expiration(date(2026, 7, 24)) is False
+
+
+class TestSelectExpirationFromDteRange:
+    """Tests for DTE-range expiration selection with monthly preference."""
+
+    def test_prefers_monthly_closest_to_center(self):
+        today = date(2026, 6, 12)
+        available = [date(2026, 7, 10), date(2026, 7, 17), date(2026, 7, 24)]
+
+        selected = select_expiration_from_dte_range(available, min_dte=25, max_dte=45, today=today)
+
+        assert selected == date(2026, 7, 17)
+
+    def test_falls_back_to_closest_to_center_when_no_monthly(self):
+        today = date(2026, 6, 12)
+        available = [date(2026, 7, 10), date(2026, 7, 24)]
+
+        selected = select_expiration_from_dte_range(available, min_dte=25, max_dte=32, today=today)
+
+        assert selected == date(2026, 7, 10)
+
+    def test_no_candidates_raises_error_with_nearest_alternatives(self):
+        today = date(2026, 6, 12)
+        available = [date(2026, 7, 17)]
+
+        with pytest.raises(ValueError, match="No expirations found between 1-5 DTE"):
+            select_expiration_from_dte_range(available, min_dte=1, max_dte=5, today=today)
+
+
 class TestFindStrikesByDeltaTool:
     """Tests for find_strikes_by_delta tool orchestration."""
 
     @pytest.mark.asyncio
-    async def test_returns_matched_strikes_for_both_signs(self):
+    async def test_returns_matched_strikes_for_both_signs_with_explicit_expiration(self):
         session = Mock()
         mock_ctx = Mock()
         mock_ctx.request_context = Mock()
@@ -527,7 +570,9 @@ class TestFindStrikesByDeltaTool:
             patch("tasty_agent.server.get_cached_option_chain", new=AsyncMock(return_value=chain)) as chain_mock,
             patch("tasty_agent.server._stream_events", new=AsyncMock(return_value=greeks)) as stream_mock,
         ):
-            result = await find_strikes_by_delta(mock_ctx, "spy", "2026-07-17", [0.16, -0.16], timeout=3.0)
+            result = await find_strikes_by_delta(
+                mock_ctx, "spy", [0.16, -0.16], expiration_date="2026-07-17", timeout=3.0
+            )
 
         chain_mock.assert_awaited_once_with(session, "SPY")
         stream_mock.assert_awaited_once()
@@ -537,6 +582,7 @@ class TestFindStrikesByDeltaTool:
         assert "<strikes_by_delta>" in result
         assert ".SPY260717C785" in result
         assert ".SPY260717P710" in result
+        assert "expiration:" not in result
 
     @pytest.mark.asyncio
     async def test_invalid_expiration_lists_available_dates(self):
@@ -551,7 +597,7 @@ class TestFindStrikesByDeltaTool:
             patch("tasty_agent.server.get_cached_option_chain", new=AsyncMock(return_value=chain)),
             pytest.raises(ValueError, match=r"Available: \[.*2026, 7, 17.*\]"),
         ):
-            await find_strikes_by_delta(mock_ctx, "SPY", "2026-08-21", [0.16])
+            await find_strikes_by_delta(mock_ctx, "SPY", [0.16], expiration_date="2026-08-21")
 
     @pytest.mark.asyncio
     async def test_zero_target_delta_rejected_before_fetching_chain(self):
@@ -561,9 +607,98 @@ class TestFindStrikesByDeltaTool:
             patch("tasty_agent.server.get_cached_option_chain", new=AsyncMock()) as chain_mock,
             pytest.raises(ValueError, match="target_delta = 0 is not valid"),
         ):
-            await find_strikes_by_delta(mock_ctx, "SPY", "2026-07-17", [0])
+            await find_strikes_by_delta(mock_ctx, "SPY", [0], expiration_date="2026-07-17")
 
         chain_mock.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_missing_expiration_and_dte_range_raises_error(self):
+        mock_ctx = Mock()
+
+        with pytest.raises(ValueError, match="Provide expiration_date, or both min_dte and max_dte"):
+            await find_strikes_by_delta(mock_ctx, "SPY", [0.16])
+
+    @pytest.mark.asyncio
+    async def test_min_dte_greater_than_max_dte_raises_error(self):
+        mock_ctx = Mock()
+
+        with pytest.raises(ValueError, match=r"min_dte \(45\) must be <= max_dte \(35\)"):
+            await find_strikes_by_delta(mock_ctx, "SPY", [0.16], min_dte=45, max_dte=35)
+
+    @pytest.mark.asyncio
+    async def test_futures_without_expiration_date_rejects_dte_range(self):
+        mock_ctx = Mock()
+
+        with (
+            patch("tasty_agent.server.get_cached_future_option_chain", new=AsyncMock()) as chain_mock,
+            pytest.raises(ValueError, match="Futures options require explicit expiration_date"),
+        ):
+            await find_strikes_by_delta(mock_ctx, "/ES", [0.16], min_dte=35, max_dte=45)
+
+        chain_mock.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_dte_range_selects_monthly_and_prefixes_expiration_header(self):
+        session = Mock()
+        mock_ctx = Mock()
+        mock_ctx.request_context = Mock()
+        mock_ctx.request_context.lifespan_context = SimpleNamespace(session=session)
+
+        weekly_exp = date(2026, 7, 10)
+        monthly_exp = date(2026, 7, 17)
+        call = _make_option(".SPY260717C785", OptionType.CALL, "785")
+        chain = {
+            weekly_exp: [call],
+            monthly_exp: [call],
+        }
+        greeks = [_make_greek(".SPY260717C785", "0.148")]
+
+        with (
+            patch("tasty_agent.server.get_cached_option_chain", new=AsyncMock(return_value=chain)),
+            patch("tasty_agent.server._stream_events", new=AsyncMock(return_value=greeks)),
+            patch("tasty_agent.server.now_in_new_york", return_value=datetime(2026, 6, 12, 12, 0)),
+        ):
+            result = await find_strikes_by_delta(mock_ctx, "SPY", [0.16], min_dte=25, max_dte=45)
+
+        assert "expiration: 2026-07-17 (35 DTE, monthly)" in result
+
+    @pytest.mark.asyncio
+    async def test_dte_range_falls_back_to_closest_when_no_monthly(self):
+        session = Mock()
+        mock_ctx = Mock()
+        mock_ctx.request_context = Mock()
+        mock_ctx.request_context.lifespan_context = SimpleNamespace(session=session)
+
+        weekly_exp = date(2026, 7, 10)
+        call = _make_option(".SPY260710C785", OptionType.CALL, "785")
+        chain = {weekly_exp: [call]}
+        greeks = [_make_greek(".SPY260710C785", "0.148")]
+
+        with (
+            patch("tasty_agent.server.get_cached_option_chain", new=AsyncMock(return_value=chain)),
+            patch("tasty_agent.server._stream_events", new=AsyncMock(return_value=greeks)),
+            patch("tasty_agent.server.now_in_new_york", return_value=datetime(2026, 6, 12, 12, 0)),
+        ):
+            result = await find_strikes_by_delta(mock_ctx, "SPY", [0.16], min_dte=25, max_dte=32)
+
+        assert "expiration: 2026-07-10 (28 DTE)" in result
+        assert "monthly" not in result
+
+    @pytest.mark.asyncio
+    async def test_no_expirations_in_dte_range_lists_nearest_alternatives(self):
+        session = Mock()
+        mock_ctx = Mock()
+        mock_ctx.request_context = Mock()
+        mock_ctx.request_context.lifespan_context = SimpleNamespace(session=session)
+
+        chain = {date(2026, 7, 17): []}
+
+        with (
+            patch("tasty_agent.server.get_cached_option_chain", new=AsyncMock(return_value=chain)),
+            patch("tasty_agent.server.now_in_new_york", return_value=datetime(2026, 6, 12, 12, 0)),
+            pytest.raises(ValueError, match="No expirations found between 1-5 DTE"),
+        ):
+            await find_strikes_by_delta(mock_ctx, "SPY", [0.16], min_dte=1, max_dte=5)
 
 
 class TestOrderTools:

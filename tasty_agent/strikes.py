@@ -1,11 +1,50 @@
 from __future__ import annotations
 
+from datetime import date, timedelta
 from typing import Any
 
 from tastytrade.dxfeed import Greeks
 from tastytrade.instruments import FutureOption, Option
 
 from tasty_agent.core import compact_value
+
+
+def is_monthly_expiration(expiration: date) -> bool:
+    """Return whether expiration is the standard monthly (3rd Friday of its month)."""
+    first = expiration.replace(day=1)
+    friday_offset = (4 - first.weekday()) % 7
+    third_friday = first + timedelta(days=friday_offset + 14)
+    return expiration == third_friday
+
+
+def select_expiration_from_dte_range(
+    available_expirations: list[date],
+    min_dte: int,
+    max_dte: int,
+    today: date,
+) -> date:
+    """Select the best expiration within [min_dte, max_dte] DTE.
+
+    Prefers standard monthly expirations (3rd Friday) closest to the center of
+    the range; falls back to the closest candidate if none are monthly.
+    """
+    min_date = today + timedelta(days=min_dte)
+    max_date = today + timedelta(days=max_dte)
+    candidates = [exp for exp in available_expirations if min_date <= exp <= max_date]
+
+    if not candidates:
+        nearby = sorted(
+            available_expirations,
+            key=lambda exp: min(abs((exp - min_date).days), abs((exp - max_date).days)),
+        )[:5]
+        raise ValueError(
+            f"No expirations found between {min_dte}-{max_dte} DTE. Nearest available: {nearby}"
+        )
+
+    target_date = today + timedelta(days=(min_dte + max_dte) // 2)
+    monthlies = [exp for exp in candidates if is_monthly_expiration(exp)]
+    pool = monthlies or candidates
+    return min(pool, key=lambda exp: abs((exp - target_date).days))
 
 
 def validate_target_deltas(target_deltas: list[float]) -> None:

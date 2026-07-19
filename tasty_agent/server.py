@@ -43,6 +43,7 @@ from tasty_agent.orders import (
     find_live_order,
     format_order_market,
     format_signed_money,
+    get_cached_future_option_chain,
     get_cached_option_chain,
     get_instrument_details,
     get_option_instrument_details,
@@ -50,7 +51,13 @@ from tasty_agent.orders import (
     resolve_order_price,
     validate_date_format,
 )
-from tasty_agent.strikes import compact_strike_match, find_nearest_strikes_by_delta, validate_target_deltas
+from tasty_agent.strikes import (
+    compact_strike_match,
+    find_nearest_strikes_by_delta,
+    is_monthly_expiration,
+    select_expiration_from_dte_range,
+    validate_target_deltas,
+)
 from tasty_agent.watchlists import WatchlistSymbol, manage_watchlist
 
 logger = logging.getLogger(__name__)
@@ -515,8 +522,10 @@ async def get_greeks(ctx: Context, options: list[OptionSpec], timeout: float = 1
 async def find_strikes_by_delta(
     ctx: Context,
     symbol: str,
-    expiration_date: str,
     target_deltas: list[float],
+    expiration_date: str | None = None,
+    min_dte: int | None = None,
+    max_dte: int | None = None,
     timeout: float = 10.0,
 ) -> str:
     """
@@ -533,24 +542,57 @@ async def find_strikes_by_delta(
     For iron condor wings on both sides, use [0.16, -0.16].
     For a single-side credit spread, use [0.30] (call) or [-0.30] (put).
 
+    Alternative to expiration_date: provide min_dte and max_dte to
+    automatically select the best expiration within a DTE range.
+    Prefers standard monthly expirations (3rd Friday) when available,
+    selects closest to center of range.
+    DTE range is for equity options only -- futures require expiration_date.
+    Example: min_dte=35, max_dte=45 for ~40 DTE premium selling.
+
     Args:
         symbol: Underlying symbol, e.g. SPY, AAPL, /ES.
-        expiration_date: YYYY-MM-DD. Use get_greeks with an invalid date
-            to discover available expirations.
         target_deltas: List of target deltas. Sign determines side
             (positive=call, negative=put). Example: [0.16, -0.16].
+        expiration_date: YYYY-MM-DD. Use get_greeks with an invalid date
+            to discover available expirations.
+        min_dte: Minimum days to expiration (equity options only, requires max_dte).
+        max_dte: Maximum days to expiration (equity options only, requires min_dte).
         timeout: Seconds to wait for DXLink data.
     """
     validate_target_deltas(target_deltas)
 
+    if expiration_date is None and (min_dte is None or max_dte is None):
+        raise ValueError("Provide expiration_date, or both min_dte and max_dte")
+    if min_dte is not None and max_dte is not None and min_dte > max_dte:
+        raise ValueError(f"min_dte ({min_dte}) must be <= max_dte ({max_dte})")
+
     session = get_session(ctx)
     symbol = symbol.upper()
-    target_date = validate_date_format(expiration_date)
+    is_future = symbol.startswith("/")
 
-    chain = await get_cached_option_chain(session, symbol)
-    if target_date not in chain:
-        available_dates = sorted(chain.keys())
-        raise ValueError(f"No options found for {symbol} expiration {expiration_date}. Available: {available_dates}")
+    if is_future and expiration_date is None:
+        raise ValueError(
+            "Futures options require explicit expiration_date. "
+            "DTE range (min_dte/max_dte) is supported for equity options only."
+        )
+
+    chain = (
+        await get_cached_future_option_chain(session, symbol)
+        if is_future
+        else await get_cached_option_chain(session, symbol)
+    )
+
+    dte: int | None = None
+    if expiration_date is not None:
+        target_date = validate_date_format(expiration_date)
+        if target_date not in chain:
+            available_dates = sorted(chain.keys())
+            raise ValueError(f"No options found for {symbol} expiration {expiration_date}. Available: {available_dates}")
+    else:
+        assert min_dte is not None and max_dte is not None  # validated above
+        today = now_in_new_york().date()
+        target_date = select_expiration_from_dte_range(sorted(chain.keys()), min_dte, max_dte, today)
+        dte = (target_date - today).days
 
     options = chain[target_date]
     streamer_symbols = [option.streamer_symbol for option in options]
@@ -559,7 +601,13 @@ async def find_strikes_by_delta(
 
     matches = find_nearest_strikes_by_delta(options, greeks_by_symbol, target_deltas)
     rows = [compact_strike_match(target, option, greek) for target, option, greek in matches]
-    return tool_xml("find_strikes_by_delta", to_table(rows))
+    table = to_table(rows)
+
+    if dte is not None:
+        monthly_label = ", monthly" if is_monthly_expiration(target_date) else ""
+        table = f"expiration: {target_date} ({dte} DTE{monthly_label})\n\n{table}"
+
+    return tool_xml("find_strikes_by_delta", table)
 
 
 @mcp_app.tool()
