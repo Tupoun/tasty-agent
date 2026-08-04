@@ -74,19 +74,18 @@ def _money_sum(*values: Any) -> Decimal:
     return total
 
 
-def _compact_order_legs(legs: list[Any] | None) -> str | None:
+def _compact_order_legs(legs: list[Any] | None) -> str:
     if not legs:
-        return None
+        raise ValueError("Broker order is missing legs")
     parts = []
     for leg in legs:
         action = compact_value(getattr(leg, "action", None))
         quantity = compact_value(getattr(leg, "quantity", None))
         symbol = getattr(leg, "symbol", None)
-        if action and quantity and symbol:
-            parts.append(f"{action} {quantity} {symbol}")
-        elif symbol:
-            parts.append(str(symbol))
-    return "; ".join(parts) if parts else None
+        if not action or not quantity or not symbol:
+            raise ValueError("Broker order leg is missing action, quantity, or symbol")
+        parts.append(f"{action} {quantity} {symbol}")
+    return "; ".join(parts)
 
 
 def _compact_transaction(transaction) -> dict[str, Any]:
@@ -140,6 +139,11 @@ async def build_account_overview(
     """Fetch account balances and/or positions and format the response."""
     if include is None:
         include = ["balances", "positions"]
+    if not include:
+        raise ValueError("include must request balances, positions, or both")
+    unknown_sections = {section for section in include if section not in {"balances", "positions"}}
+    if unknown_sections:
+        raise ValueError(f"Unsupported account overview sections: {sorted(unknown_sections)}")
 
     context = get_context(ctx)
     session = context.session
@@ -171,6 +175,16 @@ async def fetch_history(
     limit: int = 25,
 ) -> str:
     """Fetch transaction or order history and return it as a table."""
+    if type not in {"transactions", "orders"}:
+        raise ValueError("type must be 'transactions' or 'orders'")
+    if days is not None and days < 0:
+        raise ValueError("days must be non-negative")
+    if page_offset < 0:
+        raise ValueError("page_offset must be non-negative")
+    if limit < 1:
+        raise ValueError("limit must be positive")
+    if type == "orders" and transaction_type is not None:
+        raise ValueError("transaction_type is only valid for transaction history")
     context = get_context(ctx)
     session = context.session
     effective_days = days if days is not None else (90 if type == "transactions" else 7)
@@ -185,7 +199,7 @@ async def fetch_history(
             per_page=limit,
             page_offset=page_offset,
         )
-    else:
+    elif type == "orders":
         items = await context.account.get_order_history(
             session,
             start_date=start,
@@ -194,6 +208,8 @@ async def fetch_history(
             page_offset=page_offset,
         )
 
+    if items is None:
+        raise ValueError(f"Broker returned no {type} collection")
     if type == "transactions":
-        return to_table([_compact_transaction(item) for item in items or []])
-    return to_table([_compact_order(item) for item in items or []])
+        return to_table([_compact_transaction(item) for item in items])
+    return to_table([_compact_order(item) for item in items])

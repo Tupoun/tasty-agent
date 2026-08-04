@@ -35,12 +35,22 @@ def _watchlist_entries(symbols: list[WatchlistSymbol]) -> list[dict[str, str]]:
 def _compact_watchlist(watchlist, *, include_symbols: bool) -> dict[str, Any]:
     """Return watchlist metadata with compact symbol entries."""
     data = watchlist.model_dump()
-    entries = data.get("watchlist_entries") or []
+    if not data.get("name"):
+        raise ValueError("Watchlist is missing name")
+    entries = data.get("watchlist_entries")
+    if not isinstance(entries, list):
+        raise ValueError(f"Watchlist {data.get('name')!r} is missing symbol entries")
     symbols = []
-    for entry in entries:
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            raise ValueError(f"Watchlist entry {index} must be an object")
         symbol = entry.get("symbol")
         instrument_type = entry.get("instrument_type")
-        symbols.append(f"{symbol}:{instrument_type}" if instrument_type else symbol)
+        if not isinstance(symbol, str) or not symbol:
+            raise ValueError(f"Watchlist entry {index} is missing symbol")
+        if not isinstance(instrument_type, str) or not instrument_type:
+            raise ValueError(f"Watchlist entry {index} is missing instrument_type")
+        symbols.append(f"{symbol}:{instrument_type}")
     result: dict[str, Any] = {
         "name": data.get("name"),
         "group": data.get("group_name"),
@@ -59,6 +69,10 @@ async def manage_watchlist(
     symbols: list[WatchlistSymbol] | None = None,
 ) -> list[dict[str, Any]] | dict[str, Any]:
     """Manage watchlists: list, add symbols, remove symbols, or delete."""
+    if watchlist_type not in {"public", "private"}:
+        raise ValueError(f"Unsupported watchlist type: {watchlist_type}")
+    if name is not None and not name.strip():
+        raise ValueError("watchlist name must not be blank")
     session = get_session(ctx)
 
     if action == "list":
@@ -68,6 +82,9 @@ async def manage_watchlist(
         return [
             _compact_watchlist(watchlist, include_symbols=False) for watchlist in await watchlist_class.get(session)
         ]
+
+    if watchlist_type != "private":
+        raise ValueError(f"action='{action}' is supported only for private watchlists")
 
     effective_name = name or "main"
 
@@ -81,7 +98,9 @@ async def manage_watchlist(
     if action == "add":
         return await _add_watchlist_symbols(ctx, session, effective_name, symbols)
 
-    return await _remove_watchlist_symbols(ctx, session, effective_name, symbols)
+    if action == "remove":
+        return await _remove_watchlist_symbols(ctx, session, effective_name, symbols)
+    raise ValueError(f"Unsupported watchlist action: {action}")
 
 
 async def _add_watchlist_symbols(
@@ -92,9 +111,12 @@ async def _add_watchlist_symbols(
 ) -> dict[str, Any]:
     """Add symbols to a private watchlist, creating it if needed."""
     symbol_list = _symbol_list(symbols)
-    try:
-        watchlist = await PrivateWatchlist.get(session, watchlist_name)
-    except Exception:
+    watchlists = await PrivateWatchlist.get(session)
+    watchlist = next(
+        (candidate for candidate in watchlists if candidate.name == watchlist_name),
+        None,
+    )
+    if watchlist is None:
         watchlist = PrivateWatchlist(
             name=watchlist_name,
             group_name="main",

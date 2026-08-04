@@ -47,7 +47,7 @@ npx @modelcontextprotocol/inspector uvx tasty-agent  # MCP inspector
 Requires `.env` or environment variables:
 - `TASTYTRADE_CLIENT_SECRET` (required)
 - `TASTYTRADE_REFRESH_TOKEN` (required)
-- `TASTYTRADE_ACCOUNT_ID` (optional, defaults to first account)
+- `TASTYTRADE_ACCOUNT_ID` (optional for a single-account grant; required when multiple accounts are available)
 
 ## Examples
 

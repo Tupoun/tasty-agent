@@ -5,7 +5,7 @@ import logging
 from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import ROUND_FLOOR, ROUND_HALF_UP, Decimal
-from math import gcd
+from math import gcd, isfinite
 from typing import Any, Literal
 
 from aiocache import Cache, cached
@@ -62,6 +62,16 @@ class InstrumentSpec(BaseModel):
     option_type: Literal["C", "P"] | None = Field(None, description="C=call, P=put; required for options.")
     strike_price: float | None = Field(None, description="Required for options.")
     expiration_date: str | None = Field(None, description="YYYY-MM-DD; required for options.")
+
+    @model_validator(mode="after")
+    def validate_instrument_fields(self) -> InstrumentSpec:
+        option_fields = (self.option_type, self.strike_price, self.expiration_date)
+        supplied_option_fields = sum(value is not None for value in option_fields)
+        if self.instrument_type is not None and supplied_option_fields:
+            raise ValueError("instrument_type cannot be combined with option_type, strike_price, or expiration_date")
+        if supplied_option_fields not in {0, len(option_fields)}:
+            raise ValueError("option_type, strike_price, and expiration_date must be supplied together")
+        return self
 
 
 class OptionSpec(BaseModel):
@@ -225,6 +235,8 @@ def validate_strike_price(strike_price: Any) -> float:
         strike = float(strike_price)
     except (ValueError, TypeError) as e:
         raise ValueError(f"Invalid strike price '{strike_price}'. Expected positive number.") from e
+    if not isfinite(strike):
+        raise ValueError(f"Invalid strike price '{strike_price}'. Must be finite.")
     if strike <= 0:
         raise ValueError(f"Invalid strike price '{strike_price}'. Must be positive.")
     return strike
@@ -282,40 +294,49 @@ def _has_tick_price_inside(market: OrderMarket) -> bool:
 
 def _asset_tick_size(tick_sizes: list[TickSize] | None, price: Decimal) -> Decimal | None:
     """Resolve the valid tick from tastytrade asset tick-size data."""
-    if not tick_sizes or not isinstance(tick_sizes, list | tuple):
+    if tick_sizes is None:
         return None
+    if not isinstance(tick_sizes, list | tuple) or not tick_sizes:
+        raise ValueError("Broker tick-size data must be a non-empty collection")
 
     absolute_price = abs(price)
     threshold_matches = [tick for tick in tick_sizes if tick.threshold is not None and absolute_price >= tick.threshold]
     if threshold_matches:
         tick = max(threshold_matches, key=lambda item: item.threshold or Decimal("0"))
-        return tick.value
+        return _validate_tick_size(tick.value)
 
     thresholdless = [tick for tick in tick_sizes if tick.threshold is None]
+    if len(thresholdless) > 1:
+        raise ValueError("Ambiguous asset tick-size data: multiple base tick sizes")
     if thresholdless:
-        return thresholdless[0].value
-    return None
+        return _validate_tick_size(thresholdless[0].value)
+    raise ValueError(f"Broker tick-size data has no rule for price {price}")
+
+
+def _validate_tick_size(value: Any) -> Decimal:
+    tick_size = Decimal(str(value))
+    if not tick_size.is_finite() or tick_size <= 0:
+        raise ValueError(f"Invalid broker tick size: {value}")
+    return tick_size
 
 
 def _instrument_tick_size(detail: InstrumentDetail, price: Decimal) -> Decimal:
     instrument = detail.instrument
     tick_size = _asset_tick_size(detail.tick_sizes, price)
-    if tick_size:
+    if tick_size is not None:
         return tick_size
 
     if isinstance(instrument, Future):
-        return Decimal(str(instrument.tick_size))
+        return _validate_tick_size(instrument.tick_size)
 
     tick_size = _asset_tick_size(getattr(instrument, "tick_sizes", None), price)
-    if tick_size:
+    if tick_size is not None:
         return tick_size
 
-    if isinstance(instrument, Option):
-        raise ValueError(
-            f"Missing option tick sizes for {describe_instrument(detail)}. "
-            "Cannot safely round the order price to the broker's tick grid."
-        )
-    return CENT
+    raise ValueError(
+        f"Missing broker tick sizes for {describe_instrument(detail)}. "
+        "Cannot safely round the order price to the broker's tick grid."
+    )
 
 
 def order_price_tick_size(
@@ -326,14 +347,9 @@ def order_price_tick_size(
         _instrument_tick_size(detail, leg_quote.mid)
         for detail, leg_quote in zip(instrument_details, leg_quotes, strict=True)
     ]
-    return max(ticks) if ticks else CENT
-
-
-def order_price_tick_cents(instrument_details: list[InstrumentDetail], market: OrderMarket) -> int:
-    tick_cents = (order_price_tick_size(instrument_details, market.legs) / CENT).to_integral_value(
-        rounding=ROUND_HALF_UP
-    )
-    return max(1, int(tick_cents))
+    if not ticks:
+        raise ValueError("Cannot resolve an order tick size without order legs")
+    return max(ticks)
 
 
 def _whole_number_quantity(leg: Any) -> int:
@@ -349,11 +365,13 @@ def _whole_number_quantity(leg: Any) -> int:
 
 
 def _quantity_gcd(legs: list[Any]) -> int:
+    if not legs:
+        raise ValueError("At least one order leg is required")
     unit_size = 0
     for leg in legs:
         quantity = _whole_number_quantity(leg)
         unit_size = quantity if unit_size == 0 else gcd(unit_size, quantity)
-    return unit_size or 1
+    return unit_size
 
 
 def _price_unit_size(legs: list[Any]) -> Decimal:
@@ -370,6 +388,8 @@ def build_order_market(
         raise ValueError(
             f"Mismatched order inputs: {len(instrument_details)} instruments, {len(legs)} legs, {len(quotes)} quotes"
         )
+    if not legs:
+        raise ValueError("At least one order leg is required")
 
     natural_price = Decimal("0")
     passive_price = Decimal("0")
@@ -516,6 +536,8 @@ def apply_order_sizing(
     """Scale leg-ratio quantities from a quote-derived per-unit price and dollar budget."""
     if sizing is None:
         return legs, None
+    if not legs or len(instrument_details) != len(legs):
+        raise ValueError(f"Mismatched sizing inputs: {len(instrument_details)} instruments vs {len(legs)} legs")
 
     ratio_gcd = _quantity_gcd(legs)
     if ratio_gcd != 1:
@@ -573,7 +595,7 @@ def resolve_instrument_type(spec: InstrumentSpec) -> InstrumentType:
     if spec.instrument_type:
         return InstrumentType(spec.instrument_type)
     if spec.option_type:
-        return InstrumentType.EQUITY_OPTION
+        return InstrumentType.FUTURE_OPTION if spec.symbol.startswith("/") else InstrumentType.EQUITY_OPTION
     if spec.symbol.startswith("/"):
         return InstrumentType.FUTURE
     return InstrumentType.EQUITY
@@ -584,7 +606,7 @@ async def _lookup_option_detail(session: Session, spec: InstrumentSpec, symbol: 
     if not spec.option_type:
         raise ValueError(f"option_type ('C' or 'P') is required for option {symbol}")
     option_type = spec.option_type
-    strike_price = validate_strike_price(spec.strike_price)
+    strike_price = Decimal(str(validate_strike_price(spec.strike_price)))
     expiration_date = spec.expiration_date
     if not expiration_date:
         raise ValueError(f"expiration_date is required for option {symbol}")
@@ -595,14 +617,23 @@ async def _lookup_option_detail(session: Session, spec: InstrumentSpec, symbol: 
         available_dates = sorted(chain.keys())
         raise ValueError(f"No options found for {symbol} expiration {expiration_date}. Available: {available_dates}")
 
-    for option in chain[target_date]:
-        if option.strike_price == strike_price and option.option_type.value == option_type:
-            underlying = await Equity.get(session, symbol)
-            return InstrumentDetail(
-                option.streamer_symbol,
-                option,
-                tick_sizes=underlying.option_tick_sizes,
-            )
+    matching_options = [
+        option
+        for option in chain[target_date]
+        if Decimal(str(option.strike_price)) == strike_price and option.option_type.value == option_type
+    ]
+    if len(matching_options) > 1:
+        raise ValueError(f"Ambiguous option contract: {symbol} {expiration_date} {option_type} {strike_price}")
+    if matching_options:
+        option = matching_options[0]
+        if not option.streamer_symbol:
+            raise ValueError(f"Option contract is missing streamer symbol: {option.symbol}")
+        underlying = await Equity.get(session, symbol)
+        return InstrumentDetail(
+            option.streamer_symbol,
+            option,
+            tick_sizes=underlying.option_tick_sizes,
+        )
 
     available_strikes = [opt.strike_price for opt in chain[target_date] if opt.option_type.value == option_type]
     raise ValueError(
@@ -624,15 +655,21 @@ async def _lookup_future_option_detail(session: Session, spec: InstrumentSpec, s
     chain = await get_cached_future_option_chain(session, symbol)
     if target_date not in chain:
         available_dates = sorted(chain.keys())
-        raise ValueError(f"No futures options found for {symbol} expiration {expiration_date}. Available: {available_dates}")
+        raise ValueError(
+            f"No futures options found for {symbol} expiration {expiration_date}. Available: {available_dates}"
+        )
 
     matching_options = [
         option
         for option in chain[target_date]
         if Decimal(str(option.strike_price)) == strike_price and option.option_type.value == option_type
     ]
+    if len(matching_options) > 1:
+        raise ValueError(f"Ambiguous futures option contract: {symbol} {expiration_date} {option_type} {strike_price}")
     if matching_options:
         option = matching_options[0]
+        if not option.streamer_symbol:
+            raise ValueError(f"Futures option contract is missing streamer symbol: {option.symbol}")
         return InstrumentDetail(option.streamer_symbol, option)
 
     available_strikes = [opt.strike_price for opt in chain[target_date] if opt.option_type.value == option_type]
@@ -644,12 +681,16 @@ async def _lookup_future_option_detail(session: Session, spec: InstrumentSpec, s
 async def _lookup_future_detail(session: Session, symbol: str) -> InstrumentDetail:
     """Resolve a future contract."""
     instrument = await Future.get(session, symbol)
+    if not instrument.streamer_symbol:
+        raise ValueError(f"Future contract is missing streamer symbol: {symbol}")
     return InstrumentDetail(instrument.streamer_symbol, instrument)
 
 
 async def _lookup_equity_detail(session: Session, symbol: str, is_index: bool = False) -> InstrumentDetail:
     """Resolve an equity or index instrument."""
     instrument = await Equity.get(session, symbol)
+    if is_index and not instrument.streamer_symbol:
+        raise ValueError(f"Index is missing streamer symbol: {symbol}")
     streamer_symbol = instrument.streamer_symbol if is_index else symbol
     return InstrumentDetail(streamer_symbol, instrument, is_index=is_index)
 
@@ -664,18 +705,29 @@ async def _lookup_order_leg_detail(session: Session, leg: Any) -> InstrumentDeta
     resolved_type = InstrumentType(instrument_type)
     if resolved_type == InstrumentType.EQUITY_OPTION:
         instrument = await Option.get(session, symbol)
+        if not instrument.streamer_symbol:
+            raise ValueError(f"Option contract is missing streamer symbol: {symbol}")
         underlying = await Equity.get(session, instrument.underlying_symbol)
         return InstrumentDetail(
             instrument.streamer_symbol,
             instrument,
             tick_sizes=underlying.option_tick_sizes,
         )
+    if resolved_type == InstrumentType.FUTURE_OPTION:
+        instrument = await FutureOption.get(session, symbol)
+        if not instrument.streamer_symbol:
+            raise ValueError(f"Futures option contract is missing streamer symbol: {symbol}")
+        return InstrumentDetail(instrument.streamer_symbol, instrument)
     if resolved_type == InstrumentType.FUTURE:
         instrument = await Future.get(session, symbol)
+        if not instrument.streamer_symbol:
+            raise ValueError(f"Future contract is missing streamer symbol: {symbol}")
         return InstrumentDetail(instrument.streamer_symbol, instrument)
     if resolved_type == InstrumentType.EQUITY:
         instrument = await Equity.get(session, symbol)
-        return InstrumentDetail(instrument.streamer_symbol or symbol, instrument)
+        if not instrument.streamer_symbol:
+            raise ValueError(f"Equity is missing streamer symbol: {symbol}")
+        return InstrumentDetail(instrument.streamer_symbol, instrument)
 
     raise ValueError(f"Replacement pricing is not supported for {resolved_type.value} legs")
 
@@ -695,13 +747,19 @@ async def get_instrument_details(session: Session, instrument_specs: list[Instru
         if resolved_type == InstrumentType.EQUITY_OPTION:
             return await _lookup_option_detail(session, spec, symbol)
 
+        if resolved_type == InstrumentType.FUTURE_OPTION:
+            return await _lookup_future_option_detail(session, spec, symbol)
+
         if resolved_type == InstrumentType.FUTURE:
             return await _lookup_future_detail(session, symbol)
 
         if resolved_type == InstrumentType.INDEX:
             return await _lookup_equity_detail(session, symbol, is_index=True)
 
-        return await _lookup_equity_detail(session, symbol)
+        if resolved_type == InstrumentType.EQUITY:
+            return await _lookup_equity_detail(session, symbol)
+
+        raise ValueError(f"Unsupported instrument type: {resolved_type.value}")
 
     return await asyncio.gather(*[lookup_single_instrument(spec) for spec in instrument_specs])
 
@@ -723,6 +781,8 @@ def build_order_legs(instrument_details: list[InstrumentDetail], legs: list[Orde
     """Build order legs from instrument details and leg specifications."""
     if len(instrument_details) != len(legs):
         raise ValueError(f"Mismatched legs: {len(instrument_details)} instruments vs {len(legs)} leg specs")
+    if not legs:
+        raise ValueError("At least one order leg is required")
 
     built_legs = []
     for detail, leg_spec in zip(instrument_details, legs, strict=True):
