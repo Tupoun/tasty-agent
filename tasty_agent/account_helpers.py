@@ -98,7 +98,9 @@ def _compact_transaction(transaction) -> dict[str, Any]:
         data.get("other_charge"),
     )
     row = {
-        "date": compact_value(data.get("executed_at") or data.get("transaction_date")),
+        "date": compact_value(
+            data.get("executed_at") if data.get("executed_at") is not None else data.get("transaction_date")
+        ),
         "type": compact_value(data.get("transaction_type")),
         "sub_type": compact_value(data.get("transaction_sub_type")),
         "symbol": compact_value(data.get("symbol")),

@@ -86,7 +86,11 @@ async def manage_watchlist(
     if watchlist_type != "private":
         raise ValueError(f"action='{action}' is supported only for private watchlists")
 
-    effective_name = name or "main"
+    if name is None:
+        logger.info("No watchlist name provided, defaulting to 'main'")
+        effective_name = "main"
+    else:
+        effective_name = name
 
     if action == "delete":
         await PrivateWatchlist.remove(session, effective_name)

@@ -157,7 +157,7 @@ async def lifespan(_) -> AsyncIterator[ServerContext]:
         accounts = await Account.get(session)
         logger.info("Successfully authenticated with Tastytrade. Found %s account(s).", len(accounts))
     except Exception as e:
-        logger.error("Failed to authenticate with Tastytrade: %s", e)
+        logger.error("Failed to authenticate with Tastytrade: %s", e, exc_info=True)
         raise
 
     account = select_account(accounts, account_id)

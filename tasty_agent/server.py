@@ -251,7 +251,7 @@ def _compact_messages(messages: list[Any] | None) -> list[str] | None:
         text = getattr(message, "message", None)
         if not code and not text:
             raise ValueError("Broker order response contains an empty message")
-        compacted.append(f"{code}: {text}" if code and text else str(text or code))
+        compacted.append(f"{code}: {text}" if code and text else str(text if text is not None else code))
     return compacted
 
 
