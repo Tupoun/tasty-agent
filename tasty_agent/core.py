@@ -60,8 +60,8 @@ def compact_row(
 def compact_value(value: Any) -> Any:
     """Return a compact, JSON/table friendly scalar."""
     if isinstance(value, Decimal):
-        if value.is_nan():
-            return None
+        if not value.is_finite():
+            raise ValueError(f"Cannot compact non-finite Decimal value: {value}")
         text = format(value.normalize(), "f")
         return text.rstrip("0").rstrip(".") if "." in text else text
     if isinstance(value, Enum):
@@ -73,9 +73,9 @@ def compact_value(value: Any) -> Any:
     if isinstance(value, BaseModel):
         return compact_model_dump(value)
     if isinstance(value, list):
-        return [compact_value(item) for item in value if item is not None]
+        return [compact_value(item) for item in value]
     if isinstance(value, tuple):
-        return tuple(compact_value(item) for item in value if item is not None)
+        return tuple(compact_value(item) for item in value)
     if isinstance(value, dict):
         return compact_dict(value)
     return value
@@ -97,32 +97,27 @@ def to_json_value(value: Any) -> Any:
     return value
 
 
-def compact_dict(data: dict[str, Any], fields: Sequence[str] | None = None) -> dict[str, Any]:
-    """Keep selected non-empty fields and compact scalar values."""
-    keys = fields or data.keys()
+def compact_dict(data: dict[str, Any]) -> dict[str, Any]:
+    """Keep non-empty fields and compact scalar values."""
     compacted: dict[str, Any] = {}
-    for key in keys:
-        if key not in data:
-            continue
-        value = compact_value(data[key])
+    for key, raw_value in data.items():
+        value = compact_value(raw_value)
         if is_compact_empty(value):
             continue
         compacted[key] = value
     return compacted
 
 
-def compact_model_dump(model: BaseModel, fields: Sequence[str] | None = None) -> dict[str, Any]:
+def compact_model_dump(model: BaseModel) -> dict[str, Any]:
     """Dump a Pydantic model without empty fields or verbose Decimal/Enum objects."""
-    return compact_dict(model.model_dump(), fields)
+    return compact_dict(model.model_dump())
 
 
-def to_table(data: Sequence[BaseModel] | Sequence[dict[str, Any]], fields: Sequence[str] | None = None) -> str:
+def to_table(data: Sequence[BaseModel] | Sequence[dict[str, Any]]) -> str:
     """Format rows as a compact plain table."""
     if not data:
         return "No data"
-    rows = [
-        compact_model_dump(item, fields) if isinstance(item, BaseModel) else compact_dict(item, fields) for item in data
-    ]
+    rows = [compact_model_dump(item) if isinstance(item, BaseModel) else compact_dict(item) for item in data]
     return tabulate(rows, headers="keys", tablefmt="plain", missingval="")
 
 
@@ -130,6 +125,27 @@ def to_table(data: Sequence[BaseModel] | Sequence[dict[str, Any]], fields: Seque
 class ServerContext:
     session: Session
     account: Account
+
+
+def select_account(accounts: list[Account], account_id: str | None) -> Account:
+    """Select one unambiguous brokerage account."""
+    if not accounts:
+        raise ValueError("No Tastytrade accounts are available for these credentials.")
+    if account_id:
+        account = next(
+            (candidate for candidate in accounts if candidate.account_number == account_id),
+            None,
+        )
+        if account is None:
+            available = [candidate.account_number for candidate in accounts]
+            raise ValueError(f"Account '{account_id}' not found. Available: {available}")
+        return account
+    if len(accounts) > 1:
+        available = [candidate.account_number for candidate in accounts]
+        raise ValueError(
+            f"TASTYTRADE_ACCOUNT_ID is required when credentials expose multiple accounts. Available: {available}"
+        )
+    return accounts[0]
 
 
 def get_context(ctx: Context) -> ServerContext:
@@ -154,23 +170,21 @@ async def lifespan(_) -> AsyncIterator[ServerContext]:
             "Missing Tastytrade OAuth credentials. Set TASTYTRADE_CLIENT_SECRET and "
             "TASTYTRADE_REFRESH_TOKEN environment variables."
         )
+    if account_id is not None and not account_id.strip():
+        raise ValueError("TASTYTRADE_ACCOUNT_ID must not be blank when configured.")
 
     try:
         session = Session(client_secret, refresh_token)
         accounts = await Account.get(session)
         logger.info("Successfully authenticated with Tastytrade. Found %s account(s).", len(accounts))
     except Exception as e:
-        logger.error("Failed to authenticate with Tastytrade: %s", e)
+        logger.error("Failed to authenticate with Tastytrade: %s", e, exc_info=True)
         raise
 
+    account = select_account(accounts, account_id)
     if account_id:
-        account = next((acc for acc in accounts if acc.account_number == account_id), None)
-        if not account:
-            available = [acc.account_number for acc in accounts]
-            raise ValueError(f"Account '{account_id}' not found. Available: {available}")
         logger.info("Using specified account: %s", account.account_number)
     else:
-        account = accounts[0]
-        logger.info("Using default account: %s", account.account_number)
+        logger.info("Using sole account: %s", account.account_number)
 
     yield ServerContext(session=session, account=account)

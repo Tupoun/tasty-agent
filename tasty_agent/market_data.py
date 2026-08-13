@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 from datetime import UTC, datetime
 from typing import Any
 
@@ -10,8 +9,6 @@ from tastytrade import Session
 from tastytrade.dxfeed import Greeks, Quote, Trade
 from tastytrade.market_sessions import ExchangeType, MarketStatus, get_market_sessions
 from tastytrade.streamer import DXLinkStreamer
-
-logger = logging.getLogger(__name__)
 
 
 def exchanges_for_symbols(streamer_symbols: list[str]) -> set[ExchangeType]:
@@ -44,11 +41,7 @@ def get_next_open_time(session, current_time: datetime) -> datetime | None:
 
 async def market_status_message(session: Session, exchanges: set[ExchangeType]) -> str | None:
     """Check if relevant markets are closed and return a message, or None if open."""
-    try:
-        market_sessions = await get_market_sessions(session, list(exchanges))
-    except Exception:
-        logger.debug("Failed to fetch market sessions for %s", exchanges, exc_info=True)
-        return None
+    market_sessions = await get_market_sessions(session, list(exchanges))
 
     current_time = datetime.now(UTC)
     closed: list[str] = []
@@ -69,13 +62,17 @@ async def market_status_message(session: Session, exchanges: set[ExchangeType]) 
 async def raise_with_market_context(
     session: Session,
     exchanges: set[ExchangeType],
-    fallback_error: ValueError,
+    primary_error: ValueError,
 ) -> None:
-    """Raise a market-closed message if applicable, otherwise raise the fallback error."""
-    market_msg = await market_status_message(session, exchanges)
+    """Add market context without hiding the primary streaming error."""
+    try:
+        market_msg = await market_status_message(session, exchanges)
+    except Exception as context_error:
+        primary_error.add_note(f"Market-status lookup also failed: {type(context_error).__name__}: {context_error}")
+        raise primary_error from context_error
     if market_msg:
-        raise ValueError(market_msg) from fallback_error
-    raise fallback_error
+        raise ValueError(market_msg) from primary_error
+    raise primary_error
 
 
 async def stream_events(

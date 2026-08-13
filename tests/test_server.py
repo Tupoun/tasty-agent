@@ -11,17 +11,21 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 from pydantic import BaseModel
+from tastytrade.dxfeed import Quote, Trade
 from tastytrade.instruments import Equity, Future, FutureOption, Option, OptionType, TickSize
 from tastytrade.market_sessions import ExchangeType, MarketStatus
 from tastytrade.order import InstrumentType, Leg, OrderAction, OrderTimeInForce
 
 from tasty_agent.account_helpers import _compact_positions
-from tasty_agent.core import to_json_value, to_table
+from tasty_agent.core import compact_value, select_account, to_json_value, to_table
 from tasty_agent.market_data import (
     exchanges_for_symbols as _exchanges_for_symbols,
 )
 from tasty_agent.market_data import (
     get_next_open_time as _get_next_open_time,
+)
+from tasty_agent.market_data import (
+    market_status_message as _market_status_message,
 )
 from tasty_agent.market_data import (
     stream_events as _stream_events,
@@ -48,6 +52,7 @@ from tasty_agent.orders import (
 from tasty_agent.server import (
     _compact_greeks_event,
     _compact_market_metric,
+    _compact_order_response,
     _compact_quote_event,
     find_strikes_by_delta,
     get_greeks,
@@ -67,7 +72,7 @@ from tasty_agent.strikes import (
     select_expiration_from_dte_range,
     validate_target_deltas,
 )
-from tasty_agent.watchlists import WatchlistSymbol, _compact_watchlist
+from tasty_agent.watchlists import WatchlistSymbol, _compact_watchlist, manage_watchlist
 
 
 class NoopLimiter:
@@ -82,6 +87,28 @@ def parse_tool_xml(text: str, tool_name: str):
     match = re.fullmatch(rf"<{tool_name}(?:\s[^>]*)?>([\s\S]*)</{tool_name}>", text)
     assert match is not None
     return json.loads(unescape(match.group(1)))
+
+
+def broker_order_response(leg: Leg):
+    order = Mock(legs=[leg])
+    order.model_dump.return_value = {
+        "id": 12345,
+        "status": "Received",
+        "underlying_symbol": leg.symbol,
+        "order_type": "Limit",
+        "time_in_force": "Day",
+        "price": Decimal("-1.10"),
+        "size": leg.quantity,
+    }
+    buying_power_effect = Mock()
+    buying_power_effect.model_dump.return_value = {"change_in_buying_power": Decimal("0")}
+    return SimpleNamespace(
+        order=order,
+        buying_power_effect=buying_power_effect,
+        fee_calculation=None,
+        warnings=None,
+        errors=None,
+    )
 
 
 class TestToTable:
@@ -99,6 +126,26 @@ class TestToTable:
         assert "AAPL" in result
         assert "TSLA" in result
         assert "option_type" not in result
+
+    def test_compact_value_preserves_null_list_positions(self):
+        assert compact_value([Decimal("1.0"), None, Decimal("2.0")]) == ["1", None, "2"]
+
+
+class TestSelectAccount:
+    def test_requires_account_id_when_credentials_expose_multiple_accounts(self):
+        accounts = [Mock(account_number="one"), Mock(account_number="two")]
+
+        with pytest.raises(ValueError, match="TASTYTRADE_ACCOUNT_ID is required"):
+            select_account(accounts, None)
+
+    def test_selects_only_account_without_configuration(self):
+        account = Mock(account_number="one")
+
+        assert select_account([account], None) is account
+
+    def test_rejects_unknown_configured_account(self):
+        with pytest.raises(ValueError, match="not found"):
+            select_account([Mock(account_number="one")], "missing")
 
 
 class TestCompactToolOutputs:
@@ -129,17 +176,28 @@ class TestCompactToolOutputs:
 
         assert "A&amp;B" in result
 
+    def test_tool_xml_rejects_unserializable_values(self):
+        with pytest.raises(TypeError):
+            tool_xml("get_quotes", {"value": object()})
+
+    def test_tool_xml_rejects_non_finite_numbers(self):
+        with pytest.raises(ValueError, match="JSON compliant"):
+            tool_xml("get_quotes", {"value": float("nan")})
+
+    def test_tool_xml_rejects_unknown_tool_name(self):
+        with pytest.raises(KeyError):
+            tool_xml("typo", {})
+
     def test_compact_quote_row_keeps_actionable_fields_only(self):
-        event = Mock()
-        event.model_dump.return_value = {
-            "event_symbol": "TSLA",
-            "event_time": 123,
-            "sequence": 456,
-            "bid_price": Decimal("10.10"),
-            "ask_price": Decimal("10.30"),
-            "bid_size": Decimal("12"),
-            "ask_size": Decimal("9"),
-        }
+        event = Quote.model_construct(
+            event_symbol="TSLA",
+            event_time=123,
+            sequence=456,
+            bid_price=Decimal("10.10"),
+            ask_price=Decimal("10.30"),
+            bid_size=Decimal("12"),
+            ask_size=Decimal("9"),
+        )
 
         row = _compact_quote_event(event)
 
@@ -151,6 +209,54 @@ class TestCompactToolOutputs:
             "bid_sz": "12",
             "ask_sz": "9",
         }
+
+    def test_compact_quote_rejects_missing_side_instead_of_using_last_price(self):
+        event = Quote.model_construct(
+            event_symbol="TSLA",
+            bid_price=Decimal("10.10"),
+        )
+
+        with pytest.raises(ValueError, match="ask price"):
+            _compact_quote_event(event)
+
+    def test_compact_trade_uses_native_trade_fields(self):
+        event = Trade.model_construct(
+            event_symbol="$SPX",
+            price=Decimal("6500.25"),
+            change=Decimal("12.50"),
+            size=2,
+            day_volume=100,
+        )
+
+        assert _compact_quote_event(event) == {
+            "sym": "$SPX",
+            "last": "6500.25",
+            "chg": "12.5",
+            "size": 2,
+            "vol": 100,
+        }
+
+    def test_compact_quote_rejects_wrong_event_type(self):
+        event = Mock()
+        event.model_dump.return_value = {
+            "event_symbol": "TSLA",
+            "bid_price": Decimal("10.10"),
+            "ask_price": Decimal("10.30"),
+        }
+
+        with pytest.raises(TypeError, match="Unsupported market-data event"):
+            _compact_quote_event(event)
+
+    def test_compact_order_response_rejects_missing_required_sections(self):
+        with pytest.raises(ValueError, match="missing required order or buying-power data"):
+            _compact_order_response(SimpleNamespace(order=None, buying_power_effect=None))
+
+    def test_compact_order_response_preserves_broker_rejection_details(self):
+        error = SimpleNamespace(code="invalid-price", message="Price is off tick")
+        response = SimpleNamespace(order=None, buying_power_effect=None, warnings=None, errors=[error])
+
+        with pytest.raises(ValueError, match="Broker rejected order: invalid-price: Price is off tick"):
+            _compact_order_response(response)
 
     def test_compact_greeks_row_omits_stream_metadata(self):
         event = Mock()
@@ -174,6 +280,13 @@ class TestCompactToolOutputs:
         assert "event_time" not in row
         assert "sequence" not in row
 
+    def test_compact_greeks_rejects_missing_symbol(self):
+        event = Mock()
+        event.model_dump.return_value = {"delta": Decimal("0.45")}
+
+        with pytest.raises(ValueError, match="missing event_symbol"):
+            _compact_greeks_event(event)
+
     def test_compact_market_metric_omits_nested_option_iv_surface(self):
         earnings = Mock()
         earnings.expected_report_date = date(2026, 1, 20)
@@ -196,6 +309,13 @@ class TestCompactToolOutputs:
         assert row["iv_rank"] == "0.21"
         assert row["earnings"] == "2026-01-20"
         assert "option_expiration_implied_volatilities" not in row
+
+    def test_compact_market_metric_rejects_missing_symbol(self):
+        metric = Mock(earnings=None)
+        metric.model_dump.return_value = {"beta": Decimal("1.2")}
+
+        with pytest.raises(ValueError, match="missing symbol"):
+            _compact_market_metric(metric)
 
     def test_compact_positions_returns_structured_rows(self):
         position = Mock()
@@ -243,6 +363,33 @@ class TestCompactToolOutputs:
         assert summary == {"name": "tech", "group": "main", "symbol_count": 2}
         assert detail["symbols"] == ["TSLA:Equity", "NVDA:Equity"]
 
+    def test_compact_watchlist_rejects_malformed_entries(self):
+        watchlist = Mock()
+        watchlist.model_dump.return_value = {
+            "name": "tech",
+            "group_name": "main",
+            "watchlist_entries": [{"symbol": "TSLA"}],
+        }
+
+        with pytest.raises(ValueError, match="instrument_type"):
+            _compact_watchlist(watchlist, include_symbols=True)
+
+    @pytest.mark.asyncio
+    async def test_add_watchlist_propagates_lookup_failure(self):
+        ctx = Mock()
+        ctx.request_context.lifespan_context = SimpleNamespace(session=Mock())
+
+        with (
+            patch("tasty_agent.watchlists.PrivateWatchlist.get", new=AsyncMock(side_effect=RuntimeError("offline"))),
+            pytest.raises(RuntimeError, match="offline"),
+        ):
+            await manage_watchlist(
+                ctx,
+                "add",
+                name="tech",
+                symbols=[WatchlistSymbol(symbol="TSLA", instrument_type="Equity")],
+            )
+
 
 class TestValidateDateFormat:
     """Tests for validate_date_format function."""
@@ -287,6 +434,11 @@ class TestValidateStrikePrice:
     def test_none_raises_error(self):
         with pytest.raises(ValueError, match="Invalid strike price"):
             validate_strike_price(None)
+
+    @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+    def test_non_finite_value_raises_error(self, value):
+        with pytest.raises(ValueError, match="finite"):
+            validate_strike_price(value)
 
 
 class TestOptionChainKeyBuilder:
@@ -345,6 +497,14 @@ class TestGetNextOpenTime:
 
         result = _get_next_open_time(mock_session, datetime.now(UTC))
         assert result is None
+
+    @pytest.mark.asyncio
+    async def test_market_status_lookup_failure_is_not_hidden(self):
+        with (
+            patch("tasty_agent.market_data.get_market_sessions", new=AsyncMock(side_effect=RuntimeError("offline"))),
+            pytest.raises(RuntimeError, match="offline"),
+        ):
+            await _market_status_message(Mock(), {ExchangeType.NYSE})
 
 
 class TestMarketStatusTool:
@@ -775,14 +935,13 @@ class TestOutputFormat:
 
     @pytest.mark.asyncio
     async def test_quotes_json_returns_list_of_dicts(self):
-        quote = Mock()
-        quote.model_dump.return_value = {
-            "event_symbol": "AAPL",
-            "bid_price": Decimal("100.00"),
-            "ask_price": Decimal("100.10"),
-            "bid_size": Decimal("5"),
-            "ask_size": Decimal("7"),
-        }
+        quote = Quote.model_construct(
+            event_symbol="AAPL",
+            bid_price=Decimal("100.00"),
+            ask_price=Decimal("100.10"),
+            bid_size=Decimal("5"),
+            ask_size=Decimal("7"),
+        )
         detail = InstrumentDetail("AAPL", Mock())
 
         with (
@@ -862,14 +1021,13 @@ class TestOutputFormat:
 
     @pytest.mark.asyncio
     async def test_quotes_json_emits_real_numbers(self):
-        quote = Mock()
-        quote.model_dump.return_value = {
-            "event_symbol": "AAPL",
-            "bid_price": Decimal("100.00"),
-            "ask_price": Decimal("100.10"),
-            "bid_size": Decimal("5"),
-            "ask_size": Decimal("7"),
-        }
+        quote = Quote.model_construct(
+            event_symbol="AAPL",
+            bid_price=Decimal("100.00"),
+            ask_price=Decimal("100.10"),
+            bid_size=Decimal("5"),
+            ask_size=Decimal("7"),
+        )
         detail = InstrumentDetail("AAPL", Mock())
 
         with (
@@ -897,8 +1055,14 @@ class TestJsonSchemaStability:
 
     @staticmethod
     def _order():
+        leg = Leg(
+            instrument_type=InstrumentType.EQUITY,
+            symbol="AAPL",
+            action=OrderAction.BUY_TO_OPEN,
+            quantity=1,
+        )
         return SimpleNamespace(
-            legs=None,
+            legs=[leg],
             model_dump=lambda: {
                 "id": 123,
                 "status": "Live",
@@ -924,8 +1088,9 @@ class TestJsonSchemaStability:
         row = parse_tool_xml(result, "orders")[0]
         for key in ("id", "status", "price", "size", "legs", "received_at", "reject_reason"):
             assert key in row, f"{key} missing — schema is not stable"
-        assert row["legs"] is None
+        assert row["legs"] == "Buy to Open 1 AAPL"
         assert row["reject_reason"] is None
+        assert row["received_at"] is None
 
     @pytest.mark.asyncio
     async def test_list_orders_json_preserves_real_zero(self):
@@ -1062,7 +1227,14 @@ class TestUntestedToolsOutputShape:
     @pytest.mark.asyncio
     async def test_get_history_orders_uses_order_endpoint_and_shape(self):
         order = SimpleNamespace(
-            legs=None,
+            legs=[
+                Leg(
+                    instrument_type=InstrumentType.EQUITY,
+                    symbol="MSFT",
+                    action=OrderAction.BUY_TO_OPEN,
+                    quantity=1,
+                )
+            ],
             model_dump=lambda: {
                 "id": 55,
                 "status": "Filled",
@@ -1190,15 +1362,6 @@ class TestOrderTools:
     @pytest.mark.asyncio
     async def test_place_order_target_value_uses_asset_option_tick_sizes_for_msft_call(self):
         account = Mock()
-        account.place_order = AsyncMock(
-            return_value=SimpleNamespace(
-                order=None,
-                buying_power_effect=None,
-                fee_calculation=None,
-                warnings=None,
-                errors=None,
-            )
-        )
         mock_ctx = Mock()
         mock_ctx.info = AsyncMock()
         mock_ctx.warning = AsyncMock()
@@ -1238,9 +1401,12 @@ class TestOrderTools:
             action=OrderAction.BUY_TO_OPEN,
             quantity=Decimal("7"),
         )
+        account.place_order = AsyncMock(return_value=broker_order_response(built_leg))
 
         with (
-            patch("tasty_agent.orders.get_cached_option_chain", new=AsyncMock(return_value={date(2028, 1, 21): [option]})),
+            patch(
+                "tasty_agent.orders.get_cached_option_chain", new=AsyncMock(return_value={date(2028, 1, 21): [option]})
+            ),
             patch("tasty_agent.orders.Equity.get", new=AsyncMock(return_value=underlying)),
             patch("tasty_agent.server._stream_events", new=AsyncMock(return_value=[quote])),
             patch("tasty_agent.server.rate_limiter", NoopLimiter()),
@@ -1251,14 +1417,13 @@ class TestOrderTools:
                 "order",
             )
 
-        assert result == {
-            "sizing": {
-                "target_value": "50000",
-                "unit_value": "6335",
-                "quantity": 7,
-                "estimated_value": "44345",
-            }
+        assert result["sizing"] == {
+            "target_value": "50000",
+            "unit_value": "6335",
+            "quantity": 7,
+            "estimated_value": "44345",
         }
+        assert result["order"]["id"] == 12345
         account.place_order.assert_awaited_once()
         placed_order = account.place_order.call_args.args[1]
         assert placed_order.price == Decimal("-63.35")
@@ -1272,15 +1437,6 @@ class TestOrderTools:
     @pytest.mark.asyncio
     async def test_replace_uses_guarded_resolved_price(self):
         account = Mock()
-        account.replace_order = AsyncMock(
-            return_value=SimpleNamespace(
-                order=None,
-                buying_power_effect=None,
-                fee_calculation=None,
-                warnings=None,
-                errors=None,
-            )
-        )
         mock_ctx = Mock()
         mock_ctx.request_context = Mock()
         mock_ctx.request_context.lifespan_context = Mock(session=Mock(), account=account)
@@ -1291,6 +1447,7 @@ class TestOrderTools:
             action=OrderAction.BUY_TO_OPEN,
             quantity=1,
         )
+        account.replace_order = AsyncMock(return_value=broker_order_response(broker_leg))
         existing_order = Mock(time_in_force=OrderTimeInForce.DAY, legs=[broker_leg])
 
         with (
@@ -1302,7 +1459,7 @@ class TestOrderTools:
         ):
             result = parse_tool_xml(await replace_order(mock_ctx, order_id="12345"), "order")
 
-        assert result == {}
+        assert result["order"]["id"] == 12345
         resolved.assert_awaited_once_with(mock_ctx, [broker_leg])
         account.replace_order.assert_awaited_once()
         new_order = account.replace_order.call_args.args[2]
@@ -1320,9 +1477,9 @@ class TestBuildOrderLegs:
         with pytest.raises(ValueError, match="Mismatched legs"):
             build_order_legs(details, legs)
 
-    def test_empty_lists_returns_empty(self):
-        result = build_order_legs([], [])
-        assert result == []
+    def test_empty_lists_raise_error(self):
+        with pytest.raises(ValueError, match="At least one order leg"):
+            build_order_legs([], [])
 
     @pytest.mark.parametrize(
         ("symbol", "action", "expected_action", "option_fields"),
@@ -1366,7 +1523,11 @@ class TestOrderPricing:
         instrument = Mock()
         instrument.symbol = symbol
         instrument.is_index = False
-        return InstrumentDetail(symbol, instrument)
+        return InstrumentDetail(
+            symbol,
+            instrument,
+            tick_sizes=[TickSize(value=Decimal("0.01"), threshold=None)],
+        )
 
     @staticmethod
     def option_detail(symbol: str) -> InstrumentDetail:
@@ -1401,6 +1562,10 @@ class TestOrderPricing:
             tick_size=Decimal("0.25"),
         )
         return InstrumentDetail(symbol, instrument)
+
+    def test_empty_order_market_is_rejected(self):
+        with pytest.raises(ValueError, match="At least one order leg"):
+            build_order_market([], [], [])
 
     def test_mid_policy_uses_exact_order_instrument_quote(self):
         leg = OrderLeg(symbol="AAPL", action=OrderAction.BUY_TO_OPEN, quantity=1)
@@ -1565,8 +1730,14 @@ class TestOrderPricing:
         )
         detail = self.option_detail(".AAPL261218C150")
 
-        with pytest.raises(ValueError, match="Missing option tick sizes"):
+        with pytest.raises(ValueError, match="Missing broker tick sizes"):
             build_order_market([detail], [leg], [self.quote("1.11", "1.13")])
+
+    def test_equity_pricing_requires_broker_tick_sizes(self):
+        leg = OrderLeg(symbol="AAPL", action=OrderAction.BUY_TO_OPEN, quantity=1)
+
+        with pytest.raises(ValueError, match="Missing broker tick sizes"):
+            build_order_market([self.equity_detail("AAPL")], [leg], [self.quote("1.11", "1.13")])
 
     def test_target_value_sizes_option_contract_quantity(self):
         leg = OrderLeg(symbol="TSLA", action=OrderAction.BUY_TO_OPEN)
@@ -1643,6 +1814,20 @@ class TestPydanticModels:
         assert spec.option_type == "C"
         assert spec.strike_price == 150.0
         assert spec.expiration_date == "2024-12-20"
+
+    def test_instrument_spec_rejects_partial_option_identity(self):
+        with pytest.raises(ValueError, match="must be supplied together"):
+            InstrumentSpec(symbol="AAPL", option_type="C")
+
+    def test_instrument_spec_rejects_conflicting_explicit_type(self):
+        with pytest.raises(ValueError, match="cannot be combined"):
+            InstrumentSpec(
+                symbol="AAPL",
+                instrument_type=InstrumentType.EQUITY,
+                option_type="C",
+                strike_price=150,
+                expiration_date="2026-12-18",
+            )
 
     def test_option_spec_requires_option_fields_and_converts_to_instrument_spec(self):
         spec = OptionSpec(
@@ -1741,7 +1926,9 @@ class TestOptionInstrumentDetails:
         )
         chain = {date(2026, 5, 30): [future_option]}
 
-        with patch("tasty_agent.orders.get_cached_future_option_chain", new=AsyncMock(return_value=chain)) as mock_chain:
+        with patch(
+            "tasty_agent.orders.get_cached_future_option_chain", new=AsyncMock(return_value=chain)
+        ) as mock_chain:
             details = await get_option_instrument_details(
                 session,
                 [

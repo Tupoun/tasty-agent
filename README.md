@@ -68,6 +68,9 @@ Add to your MCP client configuration (e.g., `claude_desktop_config.json`):
 }
 ```
 
+`TASTYTRADE_ACCOUNT_ID` may be omitted only when the OAuth grant exposes one
+brokerage account. Set it explicitly when the grant exposes multiple accounts.
+
 ### Remote (Modal)
 
 Deploy as a remote MCP server on [Modal](https://modal.com) with proxy auth:

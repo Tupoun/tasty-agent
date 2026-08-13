@@ -11,7 +11,7 @@ from aiolimiter import AsyncLimiter
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.fastmcp.prompts.base import AssistantMessage, Message, UserMessage
 from tastytrade import metrics
-from tastytrade.dxfeed import Greeks, Quote
+from tastytrade.dxfeed import Greeks, Quote, Trade
 from tastytrade.instruments import FutureOption, Option
 from tastytrade.market_sessions import ExchangeType, MarketStatus, get_market_holidays, get_market_sessions
 from tastytrade.order import OrderTimeInForce
@@ -81,6 +81,7 @@ mcp_app = FastMCP(
 )
 
 TOOL_XML_TAGS = {
+    "account_overview": "account_overview",
     "get_history": "history",
     "place_order": "order",
     "replace_order": "order",
@@ -89,8 +90,10 @@ TOOL_XML_TAGS = {
     "get_quotes": "quotes",
     "get_greeks": "greeks",
     "get_market_metrics": "market_metrics",
+    "market_status": "market_status",
     "search_symbols": "symbol_search",
     "find_strikes_by_delta": "strikes_by_delta",
+    "watchlist": "watchlist",
 }
 
 OutputFormat = Literal["table", "json"]
@@ -103,13 +106,13 @@ def tool_xml(tool_name: str, payload: Any, *, error: bool = False) -> str:
     characters as \\uXXXX sequences, which are valid JSON, so clients can
     json.loads() the tag body directly without XML-unescaping it first.
     """
-    tag_name = TOOL_XML_TAGS.get(tool_name, tool_name)
+    tag_name = TOOL_XML_TAGS[tool_name]
     attrs = ' error="true"' if error else ""
     if isinstance(payload, str):
         body = escape_xml_text(payload, quote=False)
     else:
         body = (
-            json.dumps(payload, default=str, separators=(",", ":"))
+            json.dumps(payload, allow_nan=False, separators=(",", ":"))
             .replace("&", "\\u0026")
             .replace("<", "\\u003c")
             .replace(">", "\\u003e")
@@ -181,8 +184,7 @@ async def _resolve_order_inputs(
         for warning in warnings:
             await ctx.warning(warning)
         await ctx.info(
-            f"Resolved limit price {format_signed_money(resolved_price)} "
-            f"from mid ({format_order_market(market)})."
+            f"Resolved limit price {format_signed_money(resolved_price)} from mid ({format_order_market(market)})."
         )
         logger.info(f"Auto-calculated price {resolved_price} for {len(legs)}-leg order")
         if sizing_result is not None:
@@ -253,25 +255,23 @@ async def _resolve_replacement_market_price(
     for warning in warnings:
         await ctx.warning(warning)
     await ctx.info(
-        f"Resolved replacement limit {format_signed_money(resolved_price)} "
-        f"from mid ({format_order_market(market)})."
+        f"Resolved replacement limit {format_signed_money(resolved_price)} from mid ({format_order_market(market)})."
     )
     return resolved_price
 
 
-def _compact_order_legs(legs: list[Any] | None) -> str | None:
+def _compact_order_legs(legs: list[Any] | None) -> str:
     if not legs:
-        return None
+        raise ValueError("Broker order is missing legs")
     parts = []
     for leg in legs:
         action = compact_value(getattr(leg, "action", None))
         quantity = compact_value(getattr(leg, "quantity", None))
         symbol = getattr(leg, "symbol", None)
-        if action and quantity and symbol:
-            parts.append(f"{action} {quantity} {symbol}")
-        elif symbol:
-            parts.append(str(symbol))
-    return "; ".join(parts) if parts else None
+        if not action or not quantity or not symbol:
+            raise ValueError("Broker order leg is missing action, quantity, or symbol")
+        parts.append(f"{action} {quantity} {symbol}")
+    return "; ".join(parts)
 
 
 def _compact_order(order) -> dict[str, Any]:
@@ -310,23 +310,31 @@ def _compact_messages(messages: list[Any] | None) -> list[str] | None:
     for message in messages:
         code = getattr(message, "code", None)
         text = getattr(message, "message", None)
-        compacted.append(f"{code}: {text}" if code and text else str(text or code))
+        if not code and not text:
+            raise ValueError("Broker order response contains an empty message")
+        compacted.append(f"{code}: {text}" if code and text else str(text if text is not None else code))
     return compacted
 
 
 def _compact_order_response(response) -> dict[str, Any]:
-    result: dict[str, Any] = {}
-    order = getattr(response, "order", None)
-    if order:
-        result["order"] = compact_row(_compact_order(order), drop_zero_string=True)
+    warnings = _compact_messages(getattr(response, "warnings", None))
+    errors = _compact_messages(getattr(response, "errors", None))
+    if errors:
+        raise ValueError(f"Broker rejected order: {'; '.join(errors)}")
 
+    order = getattr(response, "order", None)
     buying_power_effect = getattr(response, "buying_power_effect", None)
-    if buying_power_effect:
-        result["bp_effect"] = compact_row(
+    if order is None or buying_power_effect is None:
+        warning_context = f" Warnings: {'; '.join(warnings)}" if warnings else ""
+        raise ValueError(f"Broker order response is missing required order or buying-power data.{warning_context}")
+    result: dict[str, Any] = {
+        "order": compact_row(_compact_order(order), drop_zero_string=True),
+        "bp_effect": compact_row(
             {key: compact_value(value) for key, value in buying_power_effect.model_dump().items()},
             drop_zero_string=True,
             drop_numeric_zero=True,
-        )
+        ),
+    }
 
     fee_calculation = getattr(response, "fee_calculation", None)
     if fee_calculation:
@@ -336,40 +344,57 @@ def _compact_order_response(response) -> dict[str, Any]:
             drop_numeric_zero=True,
         )
 
-    warnings = _compact_messages(getattr(response, "warnings", None))
-    errors = _compact_messages(getattr(response, "errors", None))
     if warnings:
         result["warnings"] = warnings
-    if errors:
-        result["errors"] = errors
     return result
 
 
-def _compact_quote_event(event) -> dict[str, Any]:
+def _compact_quote_event(event: Quote | Trade) -> dict[str, Any]:
     data = event.model_dump()
+    symbol = data.get("event_symbol")
+    if not symbol:
+        raise ValueError("Market-data event is missing event_symbol")
+    if isinstance(event, Trade):
+        price = _required_market_decimal(data.get("price"), f"trade price for {symbol}")
+        return {
+            "sym": compact_value(symbol),
+            "last": compact_value(price),
+            "chg": compact_value(data.get("change")),
+            "size": compact_value(data.get("size")),
+            "vol": compact_value(data.get("day_volume")),
+        }
+    if not isinstance(event, Quote):
+        raise TypeError(f"Unsupported market-data event: {type(event).__name__}")
     bid = data.get("bid_price")
     ask = data.get("ask_price")
-    if bid is not None and ask is not None:
-        mid = (Decimal(str(bid)) + Decimal(str(ask))) / Decimal("2")
-        return {
-            "sym": compact_value(data.get("event_symbol")),
-            "bid": compact_value(bid),
-            "ask": compact_value(ask),
-            "mid": compact_value(mid),
-            "bid_sz": compact_value(data.get("bid_size")),
-            "ask_sz": compact_value(data.get("ask_size")),
-        }
+    bid_price = _required_market_decimal(bid, f"bid price for {symbol}")
+    ask_price = _required_market_decimal(ask, f"ask price for {symbol}")
+    if bid_price > ask_price:
+        raise ValueError(f"Crossed quote for {symbol}: bid {bid_price} exceeds ask {ask_price}")
+    mid = (bid_price + ask_price) / Decimal("2")
     return {
-        "sym": compact_value(data.get("event_symbol")),
-        "last": compact_value(data.get("price")),
-        "chg": compact_value(data.get("change")),
-        "size": compact_value(data.get("size")),
-        "vol": compact_value(data.get("day_volume")),
+        "sym": compact_value(symbol),
+        "bid": compact_value(bid_price),
+        "ask": compact_value(ask_price),
+        "mid": compact_value(mid),
+        "bid_sz": compact_value(data.get("bid_size")),
+        "ask_sz": compact_value(data.get("ask_size")),
     }
+
+
+def _required_market_decimal(value: Any, label: str) -> Decimal:
+    if value is None:
+        raise ValueError(f"Missing {label}")
+    decimal = Decimal(str(value))
+    if not decimal.is_finite():
+        raise ValueError(f"Invalid {label}: {value}")
+    return decimal
 
 
 def _compact_greeks_event(event) -> dict[str, Any]:
     data = event.model_dump()
+    if not data.get("event_symbol"):
+        raise ValueError("Greeks event is missing event_symbol")
     return {
         "sym": compact_value(data.get("event_symbol")),
         "price": compact_value(data.get("price")),
@@ -401,6 +426,8 @@ def compact_strike_match(target: float, option: Option | FutureOption, greek: Gr
 
 def _compact_market_metric(metric) -> dict[str, Any]:
     data = metric.model_dump()
+    if not data.get("symbol"):
+        raise ValueError("Market metric is missing symbol")
     earnings = getattr(metric, "earnings", None)
     row = {
         "symbol": compact_value(data.get("symbol")),
@@ -561,6 +588,8 @@ async def get_quotes(
     """
     if not instruments:
         raise ValueError("At least one instrument is required")
+    if timeout <= 0:
+        raise ValueError("timeout must be positive")
 
     session = get_session(ctx)
     instrument_details = await get_instrument_details(session, instruments)
@@ -592,6 +621,8 @@ async def get_greeks(
     """
     if not options:
         raise ValueError("At least one option is required")
+    if timeout <= 0:
+        raise ValueError("timeout must be positive")
 
     session = get_session(ctx)
     option_details = await get_option_instrument_details(session, options)
@@ -716,6 +747,8 @@ async def get_market_metrics(ctx: Context, symbols: list[str], output_format: Ou
     Args:
         output_format: "table" (default, compact text) or "json" (structured, for programmatic clients).
     """
+    if not symbols or any(not symbol.strip() for symbol in symbols):
+        raise ValueError("symbols must contain at least one non-blank symbol")
     session = get_session(ctx)
     result = await metrics.get_market_metrics(session, symbols)
     rows = [_compact_market_metric(metric) for metric in result]
@@ -723,9 +756,7 @@ async def get_market_metrics(ctx: Context, symbols: list[str], output_format: Ou
 
 
 @mcp_app.tool()
-async def market_status(
-    ctx: Context, exchanges: list[Literal["Equity", "CME", "CFE", "Smalls"]] | None = None
-) -> str:
+async def market_status(ctx: Context, exchanges: list[Literal["Equity", "CME", "CFE", "Smalls"]] | None = None) -> str:
     """
     Get exchange open/closed status, next open/close, holiday flags, and current NYC time.
     """
@@ -775,6 +806,10 @@ async def search_symbols(
         limit: Max results.
         output_format: "table" (default, compact text) or "json" (structured, for programmatic clients).
     """
+    if limit < 1:
+        raise ValueError("limit must be positive")
+    if not symbol.strip():
+        raise ValueError("symbol query must not be blank")
     session = get_session(ctx)
     async with rate_limiter:
         results = await symbol_search(session, symbol)
