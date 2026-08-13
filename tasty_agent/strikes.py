@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from datetime import date, timedelta
+from decimal import Decimal
 
 from tastytrade.dxfeed import Greeks
 from tastytrade.instruments import FutureOption, Option
+
+GREEKS_NUMERIC_FIELDS = ("price", "volatility", "delta", "gamma", "theta", "vega", "rho")
 
 
 def is_monthly_expiration(expiration: date) -> bool:
@@ -55,6 +58,22 @@ def validate_target_deltas(target_deltas: list[float]) -> None:
             )
 
 
+def has_usable_greeks(greek: Greeks) -> bool:
+    """Return whether every Greek on this strike is a finite number.
+
+    DXLink publishes NaN Greeks for strikes the pricing model has no output for
+    (deep wings, no open interest). Such a strike cannot be scored against a
+    target delta -- NaN loses every comparison, so min() keeps whichever
+    candidate it saw first -- and compact_value() refuses to render it. Treat it
+    as not a candidate, the same way a strike without delta data is skipped.
+    """
+    for field in GREEKS_NUMERIC_FIELDS:
+        value = getattr(greek, field, None)
+        if isinstance(value, Decimal) and not value.is_finite():
+            return False
+    return True
+
+
 def find_nearest_strikes_by_delta(
     options: list[Option | FutureOption],
     greeks_by_symbol: dict[str, Greeks],
@@ -76,7 +95,7 @@ def find_nearest_strikes_by_delta(
         candidates: list[tuple[float, Option | FutureOption, Greeks]] = []
         for option in side_options:
             greek = greeks_by_symbol.get(option.streamer_symbol)
-            if greek is None or greek.delta is None:
+            if greek is None or greek.delta is None or not has_usable_greeks(greek):
                 continue
             candidates.append((abs(float(greek.delta) - target), option, greek))
 
