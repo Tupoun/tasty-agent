@@ -54,6 +54,7 @@ from tasty_agent.server import (
     _compact_market_metric,
     _compact_order_response,
     _compact_quote_event,
+    compact_strike_match,
     find_strikes_by_delta,
     get_greeks,
     get_history,
@@ -579,19 +580,24 @@ class TestGreeksTool:
         assert "<greeks>" in result
 
 
-def _make_greek(event_symbol: str, delta: str, price: str = "1.00", volatility: str = "0.15", gamma: str = "0.01", theta: str = "-0.05", vega: str = "0.10"):
+def _make_greek(event_symbol: str, delta: str, price: str = "1.00", volatility: str = "0.15", gamma: str = "0.01", theta: str = "-0.05", vega: str = "0.10", rho: str = "0.01"):
     greek = Mock()
     greek.event_symbol = event_symbol
-    greek.delta = Decimal(delta)
-    greek.model_dump.return_value = {
-        "event_symbol": event_symbol,
+    fields = {
         "price": Decimal(price),
         "volatility": Decimal(volatility),
         "delta": Decimal(delta),
         "gamma": Decimal(gamma),
         "theta": Decimal(theta),
         "vega": Decimal(vega),
+        "rho": Decimal(rho),
     }
+    # Set the Greeks as real attributes too: strike selection reads them off the
+    # event, not out of model_dump(), and a bare Mock attribute would never look
+    # non-finite.
+    for name, value in fields.items():
+        setattr(greek, name, value)
+    greek.model_dump.return_value = {"event_symbol": event_symbol, **fields}
     return greek
 
 
@@ -693,6 +699,44 @@ class TestFindNearestStrikesByDelta:
 
         with pytest.raises(ValueError, match="No call strikes with delta data found"):
             find_nearest_strikes_by_delta([call_785], {}, [0.16])
+
+    def test_nan_greeks_strike_is_not_a_candidate(self):
+        """One illiquid wing with NaN Greeks must not abort the whole chain."""
+        nan_wing = _make_option(".SPY260717C900", OptionType.CALL, "900")
+        call_785 = _make_option(".SPY260717C785", OptionType.CALL, "785")
+        greeks_by_symbol = {
+            ".SPY260717C900": _make_greek(".SPY260717C900", "NaN", price="NaN", volatility="NaN"),
+            ".SPY260717C785": _make_greek(".SPY260717C785", "0.148"),
+        }
+
+        # NaN loses every comparison, so min() used to keep the NaN wing whenever
+        # the chain listed it first -- order must not decide the match.
+        for options in ([nan_wing, call_785], [call_785, nan_wing]):
+            matches = find_nearest_strikes_by_delta(options, greeks_by_symbol, [0.16])
+
+            assert len(matches) == 1
+            assert matches[0][1] is call_785
+            assert compact_strike_match(0.16, *matches[0][1:])["delta"] == "0.148"
+
+    def test_nan_in_a_single_greek_disqualifies_the_strike(self):
+        """A finite delta is not enough -- every rendered Greek has to be finite."""
+        call_785 = _make_option(".SPY260717C785", OptionType.CALL, "785")
+        call_790 = _make_option(".SPY260717C790", OptionType.CALL, "790")
+        greeks_by_symbol = {
+            ".SPY260717C785": _make_greek(".SPY260717C785", "0.148", vega="NaN"),
+            ".SPY260717C790": _make_greek(".SPY260717C790", "0.120"),
+        }
+
+        matches = find_nearest_strikes_by_delta([call_785, call_790], greeks_by_symbol, [0.16])
+
+        assert matches[0][1] is call_790
+
+    def test_all_strikes_nan_raises_instead_of_returning_garbage(self):
+        call_785 = _make_option(".SPY260717C785", OptionType.CALL, "785")
+        greeks_by_symbol = {".SPY260717C785": _make_greek(".SPY260717C785", "NaN")}
+
+        with pytest.raises(ValueError, match="No call strikes with delta data found"):
+            find_nearest_strikes_by_delta([call_785], greeks_by_symbol, [0.16])
 
 
 class TestIsMonthlyExpiration:
