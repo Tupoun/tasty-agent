@@ -19,7 +19,16 @@ from tastytrade.search import symbol_search
 from tastytrade.utils import now_in_new_york
 
 from tasty_agent.account_helpers import build_account_overview, fetch_history
-from tasty_agent.core import compact_row, compact_value, get_context, get_session, lifespan, to_table
+from tasty_agent.core import (
+    compact_model_dump,
+    compact_row,
+    compact_value,
+    get_context,
+    get_session,
+    lifespan,
+    to_json_value,
+    to_table,
+)
 from tasty_agent.market_data import (
     get_next_open_time as _get_next_open_time,
 )
@@ -84,13 +93,48 @@ TOOL_XML_TAGS = {
     "find_strikes_by_delta": "strikes_by_delta",
 }
 
+OutputFormat = Literal["table", "json"]
+
 
 def tool_xml(tool_name: str, payload: Any, *, error: bool = False) -> str:
-    """Format MCP tool output as one concise XML block."""
+    """Format MCP tool output as one concise XML block.
+
+    Text payloads are XML-escaped. JSON payloads instead escape the tag-breaking
+    characters as \\uXXXX sequences, which are valid JSON, so clients can
+    json.loads() the tag body directly without XML-unescaping it first.
+    """
     tag_name = TOOL_XML_TAGS.get(tool_name, tool_name)
     attrs = ' error="true"' if error else ""
-    text = payload if isinstance(payload, str) else json.dumps(payload, default=str, separators=(",", ":"))
-    return f"<{tag_name}{attrs}>{escape_xml_text(text, quote=False)}</{tag_name}>"
+    if isinstance(payload, str):
+        body = escape_xml_text(payload, quote=False)
+    else:
+        body = (
+            json.dumps(payload, default=str, separators=(",", ":"))
+            .replace("&", "\\u0026")
+            .replace("<", "\\u003c")
+            .replace(">", "\\u003e")
+        )
+    return f"<{tag_name}{attrs}>{body}</{tag_name}>"
+
+
+def tool_output(
+    tool_name: str,
+    rows: list[dict[str, Any]],
+    output_format: OutputFormat,
+    *,
+    drop_zero_string: bool = False,
+) -> str:
+    """Return tool rows as a compact table (default) or structured JSON.
+
+    Table mode drops empty values so columns stay narrow. JSON mode keeps every
+    key, including nulls, so programmatic clients get a stable schema and never
+    have to guess whether a missing key means "no data" or "field not supported".
+    """
+    if output_format == "json":
+        return tool_xml(tool_name, [to_json_value(row) for row in rows])
+    if drop_zero_string:
+        rows = [compact_row(row, drop_zero_string=True) for row in rows]
+    return tool_xml(tool_name, to_table(rows))
 
 
 def main() -> None:
@@ -245,7 +289,7 @@ def _compact_order(order) -> dict[str, Any]:
         "updated_at": compact_value(data.get("updated_at")),
         "reject_reason": compact_value(data.get("reject_reason")),
     }
-    return compact_row(row, drop_zero_string=True)
+    return row
 
 
 def _compact_sizing_result(sizing_result: OrderSizingResult | None) -> dict[str, Any] | None:
@@ -274,7 +318,7 @@ def _compact_order_response(response) -> dict[str, Any]:
     result: dict[str, Any] = {}
     order = getattr(response, "order", None)
     if order:
-        result["order"] = _compact_order(order)
+        result["order"] = compact_row(_compact_order(order), drop_zero_string=True)
 
     buying_power_effect = getattr(response, "buying_power_effect", None)
     if buying_power_effect:
@@ -374,7 +418,7 @@ def _compact_market_metric(metric) -> dict[str, Any]:
         "div_yield": compact_value(data.get("dividend_yield")),
         "earnings": compact_value(getattr(earnings, "expected_report_date", None)),
     }
-    return compact_row(row, drop_zero_string=True)
+    return row
 
 
 @mcp_app.tool()
@@ -402,6 +446,7 @@ async def get_history(
     transaction_type: Literal["Trade", "Money Movement"] | None = None,
     page_offset: int = 0,
     limit: int = 25,
+    output_format: OutputFormat = "table",
 ) -> str:
     """
     Get paginated transaction or order history.
@@ -413,9 +458,10 @@ async def get_history(
         transaction_type: Transactions only: Trade or Money Movement.
         page_offset: Starting offset.
         limit: Page size.
+        output_format: "table" (default, compact text) or "json" (structured, for programmatic clients).
     """
     async with rate_limiter:
-        return tool_xml("get_history", await fetch_history(
+        rows = await fetch_history(
             ctx,
             type=type,
             days=days,
@@ -423,7 +469,8 @@ async def get_history(
             transaction_type=transaction_type,
             page_offset=page_offset,
             limit=limit,
-        ))
+        )
+        return tool_output("get_history", rows, output_format, drop_zero_string=True)
 
 
 @mcp_app.tool()
@@ -485,21 +532,32 @@ async def cancel_order(ctx: Context, order_id: str) -> str:
 
 
 @mcp_app.tool()
-async def list_orders(ctx: Context) -> str:
-    """List all live orders."""
+async def list_orders(ctx: Context, output_format: OutputFormat = "table") -> str:
+    """List all live orders.
+
+    Args:
+        output_format: "table" (default, compact text) or "json" (structured, for programmatic clients).
+    """
     context = get_context(ctx)
     orders = await context.account.get_live_orders(context.session)
-    return tool_xml("list_orders", to_table([_compact_order(order) for order in orders]))
+    rows = [_compact_order(order) for order in orders]
+    return tool_output("list_orders", rows, output_format, drop_zero_string=True)
 
 
 @mcp_app.tool()
-async def get_quotes(ctx: Context, instruments: list[InstrumentSpec], timeout: float = 10.0) -> str:
+async def get_quotes(
+    ctx: Context,
+    instruments: list[InstrumentSpec],
+    timeout: float = 10.0,
+    output_format: OutputFormat = "table",
+) -> str:
     """
     Get live quotes for stocks, options, futures, and indices.
 
     Args:
         instruments: Use symbol only for stocks/futures; set instrument_type="Index" for SPX/VIX/NDX; add option fields for options.
         timeout: Seconds to wait for DXLink data.
+        output_format: "table" (default, compact text) or "json" (structured, for programmatic clients).
     """
     if not instruments:
         raise ValueError("At least one instrument is required")
@@ -513,17 +571,24 @@ async def get_quotes(ctx: Context, instruments: list[InstrumentSpec], timeout: f
         events = await _stream_quotes_with_trade_fallback(session, streamer_symbols, index_symbols, timeout)
     else:
         events = await _stream_events(session, Quote, streamer_symbols, timeout)
-    return tool_xml("get_quotes", to_table([_compact_quote_event(event) for event in events]))
+    rows = [_compact_quote_event(event) for event in events]
+    return tool_output("get_quotes", rows, output_format)
 
 
 @mcp_app.tool()
-async def get_greeks(ctx: Context, options: list[OptionSpec], timeout: float = 10.0) -> str:
+async def get_greeks(
+    ctx: Context,
+    options: list[OptionSpec],
+    timeout: float = 10.0,
+    output_format: OutputFormat = "table",
+) -> str:
     """
     Get option Greeks: delta, gamma, theta, vega, rho.
 
     Args:
         options: Option contracts by underlying symbol, C/P, strike, and expiration_date.
         timeout: Seconds to wait for DXLink data.
+        output_format: "table" (default, compact text) or "json" (structured, for programmatic clients).
     """
     if not options:
         raise ValueError("At least one option is required")
@@ -532,7 +597,8 @@ async def get_greeks(ctx: Context, options: list[OptionSpec], timeout: float = 1
     option_details = await get_option_instrument_details(session, options)
 
     greeks = await _stream_events(session, Greeks, [d.streamer_symbol for d in option_details], timeout)
-    return tool_xml("get_greeks", to_table([_compact_greeks_event(greek) for greek in greeks]))
+    rows = [_compact_greeks_event(greek) for greek in greeks]
+    return tool_output("get_greeks", rows, output_format)
 
 
 @mcp_app.tool()
@@ -544,6 +610,7 @@ async def find_strikes_by_delta(
     min_dte: int | None = None,
     max_dte: int | None = None,
     timeout: float = 60.0,
+    output_format: OutputFormat = "table",
 ) -> str:
     """
     Find the nearest option strikes for given target deltas.
@@ -577,6 +644,9 @@ async def find_strikes_by_delta(
         timeout: Seconds to wait for DXLink data (default: 60). Full-chain
             streaming may need more time than a single-strike lookup — this
             matches the default used by get_gex, which streams the same way.
+        output_format: "table" (default, compact text) or "json" (structured, for programmatic clients).
+            In JSON mode the expiration header becomes structured fields
+            (expiration, monthly, and dte when a DTE range was used).
     """
     validate_target_deltas(target_deltas)
 
@@ -620,23 +690,36 @@ async def find_strikes_by_delta(
 
     matches = find_nearest_strikes_by_delta(options, greeks_by_symbol, target_deltas)
     rows = [compact_strike_match(target, option, greek) for target, option, greek in matches]
-    table = to_table(rows)
 
+    if output_format == "json":
+        payload: dict[str, Any] = {
+            "expiration": str(target_date),
+            "monthly": is_monthly_expiration(target_date),
+            "strikes": [to_json_value(row) for row in rows],
+        }
+        if dte is not None:
+            payload["dte"] = dte
+        return tool_xml("find_strikes_by_delta", payload)
+
+    table = to_table(rows)
     if dte is not None:
         monthly_label = ", monthly" if is_monthly_expiration(target_date) else ""
         table = f"expiration: {target_date} ({dte} DTE{monthly_label})\n\n{table}"
-
     return tool_xml("find_strikes_by_delta", table)
 
 
 @mcp_app.tool()
-async def get_market_metrics(ctx: Context, symbols: list[str]) -> str:
+async def get_market_metrics(ctx: Context, symbols: list[str], output_format: OutputFormat = "table") -> str:
     """
     Get IV/HV, beta, liquidity, valuation, dividends, earnings. IV rank/percentile are 0-1.
+
+    Args:
+        output_format: "table" (default, compact text) or "json" (structured, for programmatic clients).
     """
     session = get_session(ctx)
     result = await metrics.get_market_metrics(session, symbols)
-    return tool_xml("get_market_metrics", to_table([_compact_market_metric(metric) for metric in result]))
+    rows = [_compact_market_metric(metric) for metric in result]
+    return tool_output("get_market_metrics", rows, output_format, drop_zero_string=True)
 
 
 @mcp_app.tool()
@@ -682,17 +765,21 @@ async def market_status(
 
 
 @mcp_app.tool()
-async def search_symbols(ctx: Context, symbol: str, limit: int = 10) -> str:
+async def search_symbols(
+    ctx: Context, symbol: str, limit: int = 10, output_format: OutputFormat = "table"
+) -> str:
     """Search symbols by ticker or company name.
 
     Args:
         symbol: Query, e.g. AAPL or Apple.
         limit: Max results.
+        output_format: "table" (default, compact text) or "json" (structured, for programmatic clients).
     """
     session = get_session(ctx)
     async with rate_limiter:
         results = await symbol_search(session, symbol)
-    return tool_xml("search_symbols", to_table(results[:limit]))
+    rows = [compact_model_dump(item) for item in results[:limit]]
+    return tool_output("search_symbols", rows, output_format)
 
 
 @mcp_app.tool()

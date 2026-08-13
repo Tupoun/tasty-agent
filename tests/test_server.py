@@ -10,12 +10,13 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
+from pydantic import BaseModel
 from tastytrade.instruments import Equity, Future, FutureOption, Option, OptionType, TickSize
 from tastytrade.market_sessions import ExchangeType, MarketStatus
 from tastytrade.order import InstrumentType, Leg, OrderAction, OrderTimeInForce
 
 from tasty_agent.account_helpers import _compact_positions
-from tasty_agent.core import to_table
+from tasty_agent.core import to_json_value, to_table
 from tasty_agent.market_data import (
     exchanges_for_symbols as _exchanges_for_symbols,
 )
@@ -50,9 +51,14 @@ from tasty_agent.server import (
     _compact_quote_event,
     find_strikes_by_delta,
     get_greeks,
+    get_history,
+    get_market_metrics,
+    get_quotes,
+    list_orders,
     market_status,
     place_order,
     replace_order,
+    search_symbols,
     tool_xml,
 )
 from tasty_agent.strikes import (
@@ -101,8 +107,27 @@ class TestCompactToolOutputs:
     def test_tool_xml_wraps_json_concisely(self):
         result = tool_xml("get_quotes", {"status": "Open", "note": "A&B"})
 
-        assert result == '<quotes>{"status":"Open","note":"A&amp;B"}</quotes>'
+        assert result == '<quotes>{"status":"Open","note":"A\\u0026B"}</quotes>'
         assert parse_tool_xml(result, "quotes") == {"status": "Open", "note": "A&B"}
+
+    def test_tool_xml_json_body_parses_without_xml_unescaping(self):
+        """JSON payloads must be json.loads-able straight from the tag body."""
+        result = tool_xml("get_quotes", [{"sym": "T", "note": "A&B <C> D"}])
+
+        body = result.removeprefix("<quotes>").removesuffix("</quotes>")
+        assert json.loads(body) == [{"sym": "T", "note": "A&B <C> D"}]
+
+    def test_tool_xml_json_body_cannot_break_out_of_its_tag(self):
+        result = tool_xml("get_quotes", [{"sym": "</quotes>"}])
+
+        assert result.count("</quotes>") == 1
+        body = result.removeprefix("<quotes>").removesuffix("</quotes>")
+        assert json.loads(body) == [{"sym": "</quotes>"}]
+
+    def test_tool_xml_still_escapes_table_text(self):
+        result = tool_xml("get_quotes", "sym  note\nT     A&B")
+
+        assert "A&amp;B" in result
 
     def test_compact_quote_row_keeps_actionable_fields_only(self):
         event = Mock()
@@ -699,6 +724,456 @@ class TestFindStrikesByDeltaTool:
             pytest.raises(ValueError, match="No expirations found between 1-5 DTE"),
         ):
             await find_strikes_by_delta(mock_ctx, "SPY", [0.16], min_dte=1, max_dte=5)
+
+
+class TestOutputFormat:
+    """Tests for the output_format parameter on table-returning tools."""
+
+    @staticmethod
+    def _ctx():
+        session = Mock()
+        mock_ctx = Mock()
+        mock_ctx.request_context = Mock()
+        mock_ctx.request_context.lifespan_context = SimpleNamespace(session=session)
+        return mock_ctx
+
+    @staticmethod
+    def _market_metric():
+        metric = Mock()
+        metric.earnings = SimpleNamespace(expected_report_date=date(2026, 1, 20))
+        metric.model_dump.return_value = {
+            "symbol": "TSLA",
+            "implied_volatility_index_rank": "0.21",
+            "beta": Decimal("1.2"),
+        }
+        return metric
+
+    @pytest.mark.asyncio
+    async def test_market_metrics_json_returns_structured_rows(self):
+        with patch(
+            "tasty_agent.server.metrics.get_market_metrics",
+            new=AsyncMock(return_value=[self._market_metric()]),
+        ):
+            result = await get_market_metrics(self._ctx(), ["TSLA"], output_format="json")
+
+        payload = parse_tool_xml(result, "market_metrics")
+        assert isinstance(payload, list)
+        assert isinstance(payload[0], dict)
+        assert payload[0]["symbol"] == "TSLA"
+
+    @pytest.mark.asyncio
+    async def test_market_metrics_defaults_to_table(self):
+        with patch(
+            "tasty_agent.server.metrics.get_market_metrics",
+            new=AsyncMock(return_value=[self._market_metric()]),
+        ):
+            result = await get_market_metrics(self._ctx(), ["TSLA"])
+
+        assert "iv_rank" in result
+        with pytest.raises(json.JSONDecodeError):
+            parse_tool_xml(result, "market_metrics")
+
+    @pytest.mark.asyncio
+    async def test_quotes_json_returns_list_of_dicts(self):
+        quote = Mock()
+        quote.model_dump.return_value = {
+            "event_symbol": "AAPL",
+            "bid_price": Decimal("100.00"),
+            "ask_price": Decimal("100.10"),
+            "bid_size": Decimal("5"),
+            "ask_size": Decimal("7"),
+        }
+        detail = InstrumentDetail("AAPL", Mock())
+
+        with (
+            patch("tasty_agent.server.get_instrument_details", new=AsyncMock(return_value=[detail])),
+            patch("tasty_agent.server._stream_events", new=AsyncMock(return_value=[quote])),
+        ):
+            result = await get_quotes(self._ctx(), [InstrumentSpec(symbol="AAPL")], output_format="json")
+
+        payload = parse_tool_xml(result, "quotes")
+        assert isinstance(payload, list)
+        assert payload[0]["sym"] == "AAPL"
+
+    @pytest.mark.asyncio
+    async def test_strikes_json_puts_dte_header_into_structured_fields(self):
+        call = _make_option(".SPY260717C785", OptionType.CALL, "785")
+        chain = {date(2026, 7, 10): [call], date(2026, 7, 17): [call]}
+        greeks = [_make_greek(".SPY260717C785", "0.148")]
+
+        with (
+            patch("tasty_agent.server.get_cached_option_chain", new=AsyncMock(return_value=chain)),
+            patch("tasty_agent.server._stream_events", new=AsyncMock(return_value=greeks)),
+            patch("tasty_agent.server.now_in_new_york", return_value=datetime(2026, 6, 12, 12, 0)),
+        ):
+            result = await find_strikes_by_delta(
+                self._ctx(), "SPY", [0.16], min_dte=25, max_dte=45, output_format="json"
+            )
+
+        assert "expiration:" not in result
+        payload = parse_tool_xml(result, "strikes_by_delta")
+        assert payload["expiration"] == "2026-07-17"
+        assert payload["monthly"] is True
+        assert payload["dte"] == 35
+        assert isinstance(payload["strikes"], list)
+        assert payload["strikes"][0]["sym"] == ".SPY260717C785"
+
+    @pytest.mark.asyncio
+    async def test_strikes_json_omits_dte_for_explicit_expiration(self):
+        call = _make_option(".SPY260717C785", OptionType.CALL, "785")
+        chain = {date(2026, 7, 17): [call]}
+        greeks = [_make_greek(".SPY260717C785", "0.148")]
+
+        with (
+            patch("tasty_agent.server.get_cached_option_chain", new=AsyncMock(return_value=chain)),
+            patch("tasty_agent.server._stream_events", new=AsyncMock(return_value=greeks)),
+        ):
+            result = await find_strikes_by_delta(
+                self._ctx(), "SPY", [0.16], expiration_date="2026-07-17", output_format="json"
+            )
+
+        payload = parse_tool_xml(result, "strikes_by_delta")
+        assert payload["expiration"] == "2026-07-17"
+        assert payload["monthly"] is True
+        assert "dte" not in payload
+
+    @pytest.mark.asyncio
+    async def test_strikes_json_emits_real_numbers_not_decimal_strings(self):
+        call = _make_option(".SPY260717C785", OptionType.CALL, "785")
+        chain = {date(2026, 7, 17): [call]}
+        greeks = [_make_greek(".SPY260717C785", "0.148", price="2.37")]
+
+        with (
+            patch("tasty_agent.server.get_cached_option_chain", new=AsyncMock(return_value=chain)),
+            patch("tasty_agent.server._stream_events", new=AsyncMock(return_value=greeks)),
+        ):
+            result = await find_strikes_by_delta(
+                self._ctx(), "SPY", [0.16], expiration_date="2026-07-17", output_format="json"
+            )
+
+        strike = parse_tool_xml(result, "strikes_by_delta")["strikes"][0]
+        assert strike["strike"] == 785
+        assert strike["delta"] == 0.148
+        assert strike["price"] == 2.37
+        # Arithmetic against the target must work without casting.
+        assert abs(strike["delta"] - strike["target"]) < 0.02
+        assert strike["sym"] == ".SPY260717C785"
+        assert strike["type"] == "C"
+
+    @pytest.mark.asyncio
+    async def test_quotes_json_emits_real_numbers(self):
+        quote = Mock()
+        quote.model_dump.return_value = {
+            "event_symbol": "AAPL",
+            "bid_price": Decimal("100.00"),
+            "ask_price": Decimal("100.10"),
+            "bid_size": Decimal("5"),
+            "ask_size": Decimal("7"),
+        }
+        detail = InstrumentDetail("AAPL", Mock())
+
+        with (
+            patch("tasty_agent.server.get_instrument_details", new=AsyncMock(return_value=[detail])),
+            patch("tasty_agent.server._stream_events", new=AsyncMock(return_value=[quote])),
+        ):
+            result = await get_quotes(self._ctx(), [InstrumentSpec(symbol="AAPL")], output_format="json")
+
+        row = parse_tool_xml(result, "quotes")[0]
+        assert row["bid"] == 100
+        assert row["ask"] == 100.1
+        assert row["mid"] == 100.05
+        assert row["bid_sz"] == 5
+
+
+class TestJsonSchemaStability:
+    """JSON mode keeps every key so clients get a stable schema; table mode drops empties."""
+
+    @staticmethod
+    def _ctx(**lifespan):
+        mock_ctx = Mock()
+        mock_ctx.request_context = Mock()
+        mock_ctx.request_context.lifespan_context = SimpleNamespace(**lifespan)
+        return mock_ctx
+
+    @staticmethod
+    def _order():
+        return SimpleNamespace(
+            legs=None,
+            model_dump=lambda: {
+                "id": 123,
+                "status": "Live",
+                "underlying_symbol": "AAPL",
+                "order_type": "Limit",
+                "time_in_force": "Day",
+                "price": Decimal("1.50"),
+                "size": Decimal("0"),
+                "received_at": None,
+                "updated_at": None,
+                "reject_reason": None,
+            },
+        )
+
+    @pytest.mark.asyncio
+    async def test_list_orders_json_keeps_all_keys_including_nulls(self):
+        account = Mock()
+        account.get_live_orders = AsyncMock(return_value=[self._order()])
+        ctx = self._ctx(session=Mock(), account=account)
+
+        result = await list_orders(ctx, output_format="json")
+
+        row = parse_tool_xml(result, "orders")[0]
+        for key in ("id", "status", "price", "size", "legs", "received_at", "reject_reason"):
+            assert key in row, f"{key} missing — schema is not stable"
+        assert row["legs"] is None
+        assert row["reject_reason"] is None
+
+    @pytest.mark.asyncio
+    async def test_list_orders_json_preserves_real_zero(self):
+        """drop_zero_string is a table nicety; a real 0 quantity is data, not emptiness."""
+        account = Mock()
+        account.get_live_orders = AsyncMock(return_value=[self._order()])
+        ctx = self._ctx(session=Mock(), account=account)
+
+        row = parse_tool_xml(await list_orders(ctx, output_format="json"), "orders")[0]
+
+        assert row["size"] == 0
+
+    @pytest.mark.asyncio
+    async def test_list_orders_table_still_drops_empties_and_zeros(self):
+        account = Mock()
+        account.get_live_orders = AsyncMock(return_value=[self._order()])
+        ctx = self._ctx(session=Mock(), account=account)
+
+        result = await list_orders(ctx)
+
+        assert "reject_reason" not in result
+        assert "size" not in result
+        assert "Live" in result
+
+    @pytest.mark.asyncio
+    async def test_market_metrics_json_keeps_all_keys_including_nulls(self):
+        metric = Mock()
+        metric.earnings = None
+        metric.model_dump.return_value = {
+            "symbol": "TSLA",
+            "implied_volatility_index_rank": "0.21",
+            "beta": None,
+            "market_cap": None,
+        }
+
+        with patch("tasty_agent.server.metrics.get_market_metrics", new=AsyncMock(return_value=[metric])):
+            result = await get_market_metrics(self._ctx(session=Mock()), ["TSLA"], output_format="json")
+
+        row = parse_tool_xml(result, "market_metrics")[0]
+        assert row["iv_rank"] == 0.21
+        assert row["beta"] is None
+        assert row["market_cap"] is None
+        assert row["earnings"] is None
+
+    @pytest.mark.asyncio
+    async def test_greeks_json_keeps_all_keys_including_nulls(self):
+        greek = Mock()
+        greek.model_dump.return_value = {
+            "event_symbol": ".SPY260717C785",
+            "price": Decimal("2.37"),
+            "volatility": Decimal("0.121"),
+            "delta": Decimal("0.148"),
+            "gamma": Decimal("0.00732"),
+            "theta": None,
+            "vega": None,
+            "rho": None,
+        }
+        option = OptionSpec(symbol="SPY", option_type="C", strike_price=785, expiration_date="2026-07-17")
+
+        with (
+            patch(
+                "tasty_agent.server.get_option_instrument_details",
+                new=AsyncMock(return_value=[InstrumentDetail(".SPY260717C785", Mock())]),
+            ),
+            patch("tasty_agent.server._stream_events", new=AsyncMock(return_value=[greek])),
+        ):
+            result = await get_greeks(self._ctx(session=Mock()), [option], output_format="json")
+
+        row = parse_tool_xml(result, "greeks")[0]
+        assert row["delta"] == 0.148
+        assert row["theta"] is None
+        assert row["rho"] is None
+
+
+class TestUntestedToolsOutputShape:
+    """Coverage for tools this branch changed but that had no tests at all."""
+
+    @staticmethod
+    def _ctx(**lifespan):
+        mock_ctx = Mock()
+        mock_ctx.request_context = Mock()
+        mock_ctx.request_context.lifespan_context = SimpleNamespace(**lifespan)
+        return mock_ctx
+
+    @staticmethod
+    def _transaction():
+        return SimpleNamespace(
+            model_dump=lambda: {
+                "executed_at": datetime(2026, 7, 15, 14, 30),
+                "transaction_type": "Trade",
+                "transaction_sub_type": "Buy to Open",
+                "symbol": "AAPL",
+                "action": "Buy to Open",
+                "quantity": Decimal("10"),
+                "price": Decimal("150.25"),
+                "value": Decimal("-1502.50"),
+                "net_value": Decimal("-1503.50"),
+                "commission": Decimal("-1.00"),
+                "order_id": 987,
+                "description": "Bought 10 AAPL @ 150.25",
+            }
+        )
+
+    @pytest.mark.asyncio
+    async def test_get_history_transactions_json(self):
+        account = Mock()
+        account.get_history = AsyncMock(return_value=[self._transaction()])
+        ctx = self._ctx(session=Mock(), account=account)
+
+        with patch("tasty_agent.server.rate_limiter", NoopLimiter()):
+            result = await get_history(ctx, type="transactions", output_format="json")
+
+        rows = parse_tool_xml(result, "history")
+        assert isinstance(rows, list)
+        assert rows[0]["symbol"] == "AAPL"
+        assert rows[0]["qty"] == 10
+        assert rows[0]["price"] == 150.25
+        assert rows[0]["date"] == "2026-07-15T14:30:00"
+        account.get_history.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_get_history_transactions_table_is_default(self):
+        account = Mock()
+        account.get_history = AsyncMock(return_value=[self._transaction()])
+        ctx = self._ctx(session=Mock(), account=account)
+
+        with patch("tasty_agent.server.rate_limiter", NoopLimiter()):
+            result = await get_history(ctx, type="transactions")
+
+        assert "symbol" in result and "AAPL" in result
+        with pytest.raises(json.JSONDecodeError):
+            parse_tool_xml(result, "history")
+
+    @pytest.mark.asyncio
+    async def test_get_history_orders_uses_order_endpoint_and_shape(self):
+        order = SimpleNamespace(
+            legs=None,
+            model_dump=lambda: {
+                "id": 55,
+                "status": "Filled",
+                "underlying_symbol": "MSFT",
+                "order_type": "Limit",
+                "time_in_force": "Day",
+                "price": Decimal("2.25"),
+                "size": Decimal("1"),
+            },
+        )
+        account = Mock()
+        account.get_order_history = AsyncMock(return_value=[order])
+        ctx = self._ctx(session=Mock(), account=account)
+
+        with patch("tasty_agent.server.rate_limiter", NoopLimiter()):
+            result = await get_history(ctx, type="orders", output_format="json")
+
+        rows = parse_tool_xml(result, "history")
+        account.get_order_history.assert_awaited_once()
+        assert rows[0]["id"] == 55
+        assert rows[0]["underlying"] == "MSFT"
+        assert rows[0]["price"] == 2.25
+
+    @pytest.mark.asyncio
+    async def test_get_history_empty_result(self):
+        account = Mock()
+        account.get_history = AsyncMock(return_value=[])
+        ctx = self._ctx(session=Mock(), account=account)
+
+        with patch("tasty_agent.server.rate_limiter", NoopLimiter()):
+            assert parse_tool_xml(await get_history(ctx, type="transactions", output_format="json"), "history") == []
+            assert "No data" in await get_history(ctx, type="transactions")
+
+    @pytest.mark.asyncio
+    async def test_search_symbols_json_and_table_shapes(self):
+        class SymbolResult(BaseModel):
+            symbol: str
+            description: str | None = None
+
+        results = [
+            SymbolResult(symbol="AAPL", description="Apple Inc"),
+            SymbolResult(symbol="AAPLW", description=None),
+        ]
+
+        with (
+            patch("tasty_agent.server.symbol_search", new=AsyncMock(return_value=results)),
+            patch("tasty_agent.server.rate_limiter", NoopLimiter()),
+        ):
+            json_result = await search_symbols(self._ctx(session=Mock()), "AAPL", output_format="json")
+            table_result = await search_symbols(self._ctx(session=Mock()), "AAPL")
+
+        rows = parse_tool_xml(json_result, "symbol_search")
+        assert rows[0] == {"symbol": "AAPL", "description": "Apple Inc"}
+        assert rows[1]["symbol"] == "AAPLW"
+        assert "AAPL" in table_result and "Apple Inc" in table_result
+
+    @pytest.mark.asyncio
+    async def test_search_symbols_respects_limit(self):
+        class SymbolResult(BaseModel):
+            symbol: str
+
+        results = [SymbolResult(symbol=f"S{i}") for i in range(5)]
+
+        with (
+            patch("tasty_agent.server.symbol_search", new=AsyncMock(return_value=results)),
+            patch("tasty_agent.server.rate_limiter", NoopLimiter()),
+        ):
+            result = await search_symbols(self._ctx(session=Mock()), "S", limit=2, output_format="json")
+
+        assert len(parse_tool_xml(result, "symbol_search")) == 2
+
+
+class TestToJsonValue:
+    """Tests for restoring JSON numbers from table-formatted decimal text."""
+
+    @pytest.mark.parametrize(
+        ("text", "expected"),
+        [
+            ("785", 785),
+            ("0.148", 0.148),
+            ("-0.083", -0.083),
+            ("0", 0),
+            ("100.05", 100.05),
+        ],
+    )
+    def test_converts_decimal_text_to_numbers(self, text, expected):
+        assert to_json_value(text) == expected
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "AAPL",
+            ".SPY260717C785",
+            "2026-01-20",
+            "2026-07-17T12:00:00",
+            "0700",
+            "Buy to Open",
+            "1e5",
+            "",
+        ],
+    )
+    def test_leaves_non_numeric_text_alone(self, text):
+        assert to_json_value(text) == text
+
+    def test_preserves_booleans_and_none(self):
+        assert to_json_value({"monthly": True, "rho": None}) == {"monthly": True, "rho": None}
+
+    def test_walks_nested_rows(self):
+        payload = {"strikes": [{"strike": "785", "sym": ".SPY260717C785"}]}
+
+        assert to_json_value(payload) == {"strikes": [{"strike": 785, "sym": ".SPY260717C785"}]}
 
 
 class TestOrderTools:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -18,6 +19,10 @@ from tastytrade import Account, Session
 logger = logging.getLogger(__name__)
 
 COMPACT_EMPTY_VALUES = (None, "", [], {})
+
+# Plain decimal literals only, as produced by compact_value() from a Decimal.
+# Leading zeros are excluded so identifier-like strings ("0700") stay strings.
+NUMERIC_TEXT_PATTERN = re.compile(r"-?(?:0|[1-9]\d*)(?:\.\d+)?")
 
 
 def is_compact_empty(
@@ -73,6 +78,22 @@ def compact_value(value: Any) -> Any:
         return tuple(compact_value(item) for item in value if item is not None)
     if isinstance(value, dict):
         return compact_dict(value)
+    return value
+
+
+def to_json_value(value: Any) -> Any:
+    """Restore JSON numbers from the decimal text compact_value() emits for tables.
+
+    Table rows carry prices and Greeks as normalized decimal strings so columns
+    line up. Programmatic clients need real numbers, so convert those back while
+    leaving every other string (symbols, dates, ids, statuses) untouched.
+    """
+    if isinstance(value, str) and NUMERIC_TEXT_PATTERN.fullmatch(value):
+        return float(value) if "." in value else int(value)
+    if isinstance(value, list):
+        return [to_json_value(item) for item in value]
+    if isinstance(value, dict):
+        return {key: to_json_value(item) for key, item in value.items()}
     return value
 
 
