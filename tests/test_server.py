@@ -50,6 +50,8 @@ from tasty_agent.server import (
     _compact_quote_event,
     find_strikes_by_delta,
     get_greeks,
+    get_market_metrics,
+    get_quotes,
     market_status,
     place_order,
     replace_order,
@@ -699,6 +701,118 @@ class TestFindStrikesByDeltaTool:
             pytest.raises(ValueError, match="No expirations found between 1-5 DTE"),
         ):
             await find_strikes_by_delta(mock_ctx, "SPY", [0.16], min_dte=1, max_dte=5)
+
+
+class TestOutputFormat:
+    """Tests for the output_format parameter on table-returning tools."""
+
+    @staticmethod
+    def _ctx():
+        session = Mock()
+        mock_ctx = Mock()
+        mock_ctx.request_context = Mock()
+        mock_ctx.request_context.lifespan_context = SimpleNamespace(session=session)
+        return mock_ctx
+
+    @staticmethod
+    def _market_metric():
+        metric = Mock()
+        metric.earnings = SimpleNamespace(expected_report_date=date(2026, 1, 20))
+        metric.model_dump.return_value = {
+            "symbol": "TSLA",
+            "implied_volatility_index_rank": "0.21",
+            "beta": Decimal("1.2"),
+        }
+        return metric
+
+    @pytest.mark.asyncio
+    async def test_market_metrics_json_returns_structured_rows(self):
+        with patch(
+            "tasty_agent.server.metrics.get_market_metrics",
+            new=AsyncMock(return_value=[self._market_metric()]),
+        ):
+            result = await get_market_metrics(self._ctx(), ["TSLA"], output_format="json")
+
+        payload = parse_tool_xml(result, "market_metrics")
+        assert isinstance(payload, list)
+        assert isinstance(payload[0], dict)
+        assert payload[0]["symbol"] == "TSLA"
+
+    @pytest.mark.asyncio
+    async def test_market_metrics_defaults_to_table(self):
+        with patch(
+            "tasty_agent.server.metrics.get_market_metrics",
+            new=AsyncMock(return_value=[self._market_metric()]),
+        ):
+            result = await get_market_metrics(self._ctx(), ["TSLA"])
+
+        assert "iv_rank" in result
+        with pytest.raises(json.JSONDecodeError):
+            parse_tool_xml(result, "market_metrics")
+
+    @pytest.mark.asyncio
+    async def test_quotes_json_returns_list_of_dicts(self):
+        quote = Mock()
+        quote.model_dump.return_value = {
+            "event_symbol": "AAPL",
+            "bid_price": Decimal("100.00"),
+            "ask_price": Decimal("100.10"),
+            "bid_size": Decimal("5"),
+            "ask_size": Decimal("7"),
+        }
+        detail = InstrumentDetail("AAPL", Mock())
+
+        with (
+            patch("tasty_agent.server.get_instrument_details", new=AsyncMock(return_value=[detail])),
+            patch("tasty_agent.server._stream_events", new=AsyncMock(return_value=[quote])),
+        ):
+            result = await get_quotes(self._ctx(), [InstrumentSpec(symbol="AAPL")], output_format="json")
+
+        payload = parse_tool_xml(result, "quotes")
+        assert isinstance(payload, list)
+        assert payload[0]["sym"] == "AAPL"
+
+    @pytest.mark.asyncio
+    async def test_strikes_json_puts_dte_header_into_structured_fields(self):
+        call = _make_option(".SPY260717C785", OptionType.CALL, "785")
+        chain = {date(2026, 7, 10): [call], date(2026, 7, 17): [call]}
+        greeks = [_make_greek(".SPY260717C785", "0.148")]
+
+        with (
+            patch("tasty_agent.server.get_cached_option_chain", new=AsyncMock(return_value=chain)),
+            patch("tasty_agent.server._stream_events", new=AsyncMock(return_value=greeks)),
+            patch("tasty_agent.server.now_in_new_york", return_value=datetime(2026, 6, 12, 12, 0)),
+        ):
+            result = await find_strikes_by_delta(
+                self._ctx(), "SPY", [0.16], min_dte=25, max_dte=45, output_format="json"
+            )
+
+        assert "expiration:" not in result
+        payload = parse_tool_xml(result, "strikes_by_delta")
+        assert payload["expiration"] == "2026-07-17"
+        assert payload["monthly"] is True
+        assert payload["dte"] == 35
+        assert isinstance(payload["strikes"], list)
+        assert payload["strikes"][0]["sym"] == ".SPY260717C785"
+
+    @pytest.mark.asyncio
+    async def test_strikes_json_omits_dte_for_explicit_expiration(self):
+        call = _make_option(".SPY260717C785", OptionType.CALL, "785")
+        chain = {date(2026, 7, 17): [call]}
+        greeks = [_make_greek(".SPY260717C785", "0.148")]
+
+        with (
+            patch("tasty_agent.server.get_cached_option_chain", new=AsyncMock(return_value=chain)),
+            patch("tasty_agent.server._stream_events", new=AsyncMock(return_value=greeks)),
+        ):
+            result = await find_strikes_by_delta(
+                self._ctx(), "SPY", [0.16], expiration_date="2026-07-17", output_format="json"
+            )
+
+        payload = parse_tool_xml(result, "strikes_by_delta")
+        assert payload["expiration"] == "2026-07-17"
+        assert payload["monthly"] is True
+        assert "dte" not in payload
 
 
 class TestOrderTools:

@@ -7,7 +7,7 @@ from typing import Any, Literal
 
 from mcp.server.fastmcp import Context
 
-from tasty_agent.core import compact_row, compact_value, get_context, to_table
+from tasty_agent.core import compact_row, compact_value, get_context
 
 BALANCE_FIELDS = {
     "net_liquidating_value": "net_liq",
@@ -169,8 +169,8 @@ async def fetch_history(
     transaction_type: Literal["Trade", "Money Movement"] | None = None,
     page_offset: int = 0,
     limit: int = 25,
-) -> str:
-    """Fetch transaction or order history and return it as a table."""
+) -> list[dict[str, Any]]:
+    """Fetch transaction or order history as compact rows."""
     context = get_context(ctx)
     session = context.session
     effective_days = days if days is not None else (90 if type == "transactions" else 7)
@@ -195,5 +195,5 @@ async def fetch_history(
         )
 
     if type == "transactions":
-        return to_table([_compact_transaction(item) for item in items or []])
-    return to_table([_compact_order(item) for item in items or []])
+        return [_compact_transaction(item) for item in items or []]
+    return [_compact_order(item) for item in items or []]
