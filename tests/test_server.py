@@ -15,7 +15,7 @@ from tastytrade.market_sessions import ExchangeType, MarketStatus
 from tastytrade.order import InstrumentType, Leg, OrderAction, OrderTimeInForce
 
 from tasty_agent.account_helpers import _compact_positions
-from tasty_agent.core import to_table
+from tasty_agent.core import to_json_value, to_table
 from tasty_agent.market_data import (
     exchanges_for_symbols as _exchanges_for_symbols,
 )
@@ -103,8 +103,27 @@ class TestCompactToolOutputs:
     def test_tool_xml_wraps_json_concisely(self):
         result = tool_xml("get_quotes", {"status": "Open", "note": "A&B"})
 
-        assert result == '<quotes>{"status":"Open","note":"A&amp;B"}</quotes>'
+        assert result == '<quotes>{"status":"Open","note":"A\\u0026B"}</quotes>'
         assert parse_tool_xml(result, "quotes") == {"status": "Open", "note": "A&B"}
+
+    def test_tool_xml_json_body_parses_without_xml_unescaping(self):
+        """JSON payloads must be json.loads-able straight from the tag body."""
+        result = tool_xml("get_quotes", [{"sym": "T", "note": "A&B <C> D"}])
+
+        body = result.removeprefix("<quotes>").removesuffix("</quotes>")
+        assert json.loads(body) == [{"sym": "T", "note": "A&B <C> D"}]
+
+    def test_tool_xml_json_body_cannot_break_out_of_its_tag(self):
+        result = tool_xml("get_quotes", [{"sym": "</quotes>"}])
+
+        assert result.count("</quotes>") == 1
+        body = result.removeprefix("<quotes>").removesuffix("</quotes>")
+        assert json.loads(body) == [{"sym": "</quotes>"}]
+
+    def test_tool_xml_still_escapes_table_text(self):
+        result = tool_xml("get_quotes", "sym  note\nT     A&B")
+
+        assert "A&amp;B" in result
 
     def test_compact_quote_row_keeps_actionable_fields_only(self):
         event = Mock()
@@ -813,6 +832,94 @@ class TestOutputFormat:
         assert payload["expiration"] == "2026-07-17"
         assert payload["monthly"] is True
         assert "dte" not in payload
+
+    @pytest.mark.asyncio
+    async def test_strikes_json_emits_real_numbers_not_decimal_strings(self):
+        call = _make_option(".SPY260717C785", OptionType.CALL, "785")
+        chain = {date(2026, 7, 17): [call]}
+        greeks = [_make_greek(".SPY260717C785", "0.148", price="2.37")]
+
+        with (
+            patch("tasty_agent.server.get_cached_option_chain", new=AsyncMock(return_value=chain)),
+            patch("tasty_agent.server._stream_events", new=AsyncMock(return_value=greeks)),
+        ):
+            result = await find_strikes_by_delta(
+                self._ctx(), "SPY", [0.16], expiration_date="2026-07-17", output_format="json"
+            )
+
+        strike = parse_tool_xml(result, "strikes_by_delta")["strikes"][0]
+        assert strike["strike"] == 785
+        assert strike["delta"] == 0.148
+        assert strike["price"] == 2.37
+        # Arithmetic against the target must work without casting.
+        assert abs(strike["delta"] - strike["target"]) < 0.02
+        assert strike["sym"] == ".SPY260717C785"
+        assert strike["type"] == "C"
+
+    @pytest.mark.asyncio
+    async def test_quotes_json_emits_real_numbers(self):
+        quote = Mock()
+        quote.model_dump.return_value = {
+            "event_symbol": "AAPL",
+            "bid_price": Decimal("100.00"),
+            "ask_price": Decimal("100.10"),
+            "bid_size": Decimal("5"),
+            "ask_size": Decimal("7"),
+        }
+        detail = InstrumentDetail("AAPL", Mock())
+
+        with (
+            patch("tasty_agent.server.get_instrument_details", new=AsyncMock(return_value=[detail])),
+            patch("tasty_agent.server._stream_events", new=AsyncMock(return_value=[quote])),
+        ):
+            result = await get_quotes(self._ctx(), [InstrumentSpec(symbol="AAPL")], output_format="json")
+
+        row = parse_tool_xml(result, "quotes")[0]
+        assert row["bid"] == 100
+        assert row["ask"] == 100.1
+        assert row["mid"] == 100.05
+        assert row["bid_sz"] == 5
+
+
+class TestToJsonValue:
+    """Tests for restoring JSON numbers from table-formatted decimal text."""
+
+    @pytest.mark.parametrize(
+        ("text", "expected"),
+        [
+            ("785", 785),
+            ("0.148", 0.148),
+            ("-0.083", -0.083),
+            ("0", 0),
+            ("100.05", 100.05),
+        ],
+    )
+    def test_converts_decimal_text_to_numbers(self, text, expected):
+        assert to_json_value(text) == expected
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "AAPL",
+            ".SPY260717C785",
+            "2026-01-20",
+            "2026-07-17T12:00:00",
+            "0700",
+            "Buy to Open",
+            "1e5",
+            "",
+        ],
+    )
+    def test_leaves_non_numeric_text_alone(self, text):
+        assert to_json_value(text) == text
+
+    def test_preserves_booleans_and_none(self):
+        assert to_json_value({"monthly": True, "rho": None}) == {"monthly": True, "rho": None}
+
+    def test_walks_nested_rows(self):
+        payload = {"strikes": [{"strike": "785", "sym": ".SPY260717C785"}]}
+
+        assert to_json_value(payload) == {"strikes": [{"strike": 785, "sym": ".SPY260717C785"}]}
 
 
 class TestOrderTools:

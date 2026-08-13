@@ -26,6 +26,7 @@ from tasty_agent.core import (
     get_context,
     get_session,
     lifespan,
+    to_json_value,
     to_table,
 )
 from tasty_agent.market_data import (
@@ -96,16 +97,31 @@ OutputFormat = Literal["table", "json"]
 
 
 def tool_xml(tool_name: str, payload: Any, *, error: bool = False) -> str:
-    """Format MCP tool output as one concise XML block."""
+    """Format MCP tool output as one concise XML block.
+
+    Text payloads are XML-escaped. JSON payloads instead escape the tag-breaking
+    characters as \\uXXXX sequences, which are valid JSON, so clients can
+    json.loads() the tag body directly without XML-unescaping it first.
+    """
     tag_name = TOOL_XML_TAGS.get(tool_name, tool_name)
     attrs = ' error="true"' if error else ""
-    text = payload if isinstance(payload, str) else json.dumps(payload, default=str, separators=(",", ":"))
-    return f"<{tag_name}{attrs}>{escape_xml_text(text, quote=False)}</{tag_name}>"
+    if isinstance(payload, str):
+        body = escape_xml_text(payload, quote=False)
+    else:
+        body = (
+            json.dumps(payload, default=str, separators=(",", ":"))
+            .replace("&", "\\u0026")
+            .replace("<", "\\u003c")
+            .replace(">", "\\u003e")
+        )
+    return f"<{tag_name}{attrs}>{body}</{tag_name}>"
 
 
 def tool_output(tool_name: str, rows: list[dict[str, Any]], output_format: OutputFormat) -> str:
     """Return tool rows as a compact table (default) or structured JSON."""
-    return tool_xml(tool_name, rows if output_format == "json" else to_table(rows))
+    if output_format == "json":
+        return tool_xml(tool_name, [to_json_value(row) for row in rows])
+    return tool_xml(tool_name, to_table(rows))
 
 
 def main() -> None:
@@ -666,7 +682,7 @@ async def find_strikes_by_delta(
         payload: dict[str, Any] = {
             "expiration": str(target_date),
             "monthly": is_monthly_expiration(target_date),
-            "strikes": rows,
+            "strikes": [to_json_value(row) for row in rows],
         }
         if dte is not None:
             payload["dte"] = dte
