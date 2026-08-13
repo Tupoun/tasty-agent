@@ -112,7 +112,7 @@ def _compact_transaction(transaction) -> dict[str, Any]:
         "order_id": compact_value(data.get("order_id")),
         "desc": _compact_text(data.get("description")),
     }
-    return compact_row(row, drop_zero_string=True)
+    return row
 
 
 def _compact_order(order) -> dict[str, Any]:
@@ -130,7 +130,7 @@ def _compact_order(order) -> dict[str, Any]:
         "updated_at": compact_value(data.get("updated_at")),
         "reject_reason": compact_value(data.get("reject_reason")),
     }
-    return compact_row(row, drop_zero_string=True)
+    return row
 
 
 async def build_account_overview(

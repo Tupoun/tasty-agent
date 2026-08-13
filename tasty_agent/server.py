@@ -117,10 +117,23 @@ def tool_xml(tool_name: str, payload: Any, *, error: bool = False) -> str:
     return f"<{tag_name}{attrs}>{body}</{tag_name}>"
 
 
-def tool_output(tool_name: str, rows: list[dict[str, Any]], output_format: OutputFormat) -> str:
-    """Return tool rows as a compact table (default) or structured JSON."""
+def tool_output(
+    tool_name: str,
+    rows: list[dict[str, Any]],
+    output_format: OutputFormat,
+    *,
+    drop_zero_string: bool = False,
+) -> str:
+    """Return tool rows as a compact table (default) or structured JSON.
+
+    Table mode drops empty values so columns stay narrow. JSON mode keeps every
+    key, including nulls, so programmatic clients get a stable schema and never
+    have to guess whether a missing key means "no data" or "field not supported".
+    """
     if output_format == "json":
         return tool_xml(tool_name, [to_json_value(row) for row in rows])
+    if drop_zero_string:
+        rows = [compact_row(row, drop_zero_string=True) for row in rows]
     return tool_xml(tool_name, to_table(rows))
 
 
@@ -276,7 +289,7 @@ def _compact_order(order) -> dict[str, Any]:
         "updated_at": compact_value(data.get("updated_at")),
         "reject_reason": compact_value(data.get("reject_reason")),
     }
-    return compact_row(row, drop_zero_string=True)
+    return row
 
 
 def _compact_sizing_result(sizing_result: OrderSizingResult | None) -> dict[str, Any] | None:
@@ -305,7 +318,7 @@ def _compact_order_response(response) -> dict[str, Any]:
     result: dict[str, Any] = {}
     order = getattr(response, "order", None)
     if order:
-        result["order"] = _compact_order(order)
+        result["order"] = compact_row(_compact_order(order), drop_zero_string=True)
 
     buying_power_effect = getattr(response, "buying_power_effect", None)
     if buying_power_effect:
@@ -405,7 +418,7 @@ def _compact_market_metric(metric) -> dict[str, Any]:
         "div_yield": compact_value(data.get("dividend_yield")),
         "earnings": compact_value(getattr(earnings, "expected_report_date", None)),
     }
-    return compact_row(row, drop_zero_string=True)
+    return row
 
 
 @mcp_app.tool()
@@ -457,7 +470,7 @@ async def get_history(
             page_offset=page_offset,
             limit=limit,
         )
-        return tool_output("get_history", rows, output_format)
+        return tool_output("get_history", rows, output_format, drop_zero_string=True)
 
 
 @mcp_app.tool()
@@ -528,7 +541,7 @@ async def list_orders(ctx: Context, output_format: OutputFormat = "table") -> st
     context = get_context(ctx)
     orders = await context.account.get_live_orders(context.session)
     rows = [_compact_order(order) for order in orders]
-    return tool_output("list_orders", rows, output_format)
+    return tool_output("list_orders", rows, output_format, drop_zero_string=True)
 
 
 @mcp_app.tool()
@@ -706,7 +719,7 @@ async def get_market_metrics(ctx: Context, symbols: list[str], output_format: Ou
     session = get_session(ctx)
     result = await metrics.get_market_metrics(session, symbols)
     rows = [_compact_market_metric(metric) for metric in result]
-    return tool_output("get_market_metrics", rows, output_format)
+    return tool_output("get_market_metrics", rows, output_format, drop_zero_string=True)
 
 
 @mcp_app.tool()
