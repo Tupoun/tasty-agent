@@ -45,12 +45,13 @@ def _compact_watchlist(watchlist, *, include_symbols: bool) -> dict[str, Any]:
         if not isinstance(entry, dict):
             raise ValueError(f"Watchlist entry {index} must be an object")
         symbol = entry.get("symbol")
-        instrument_type = entry.get("instrument_type")
         if not isinstance(symbol, str) or not symbol:
             raise ValueError(f"Watchlist entry {index} is missing symbol")
-        if not isinstance(instrument_type, str) or not instrument_type:
-            raise ValueError(f"Watchlist entry {index} is missing instrument_type")
-        symbols.append(f"{symbol}:{instrument_type}")
+        instrument_type = entry.get("instrument_type") or entry.get("instrument-type")
+        if isinstance(instrument_type, str) and instrument_type:
+            symbols.append(f"{symbol}:{instrument_type}")
+        else:
+            symbols.append(symbol)
     result: dict[str, Any] = {
         "name": data.get("name"),
         "group": data.get("group_name"),
